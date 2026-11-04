@@ -33,6 +33,12 @@ SCENARIOS = [
     ("qs-rapid", 200, "Quick Settings open, in/out every 200 ms"),
     ("qs-rapid", 120, "Quick Settings open, in/out every 120 ms"),
     ("cal-rapid", 350, "calendar open, in/out every 350 ms"),
+    ("edge", -1, "touch the edge and leave, 20x at random times (ShowDelay)"),
+    ("edge-jitter", 900, "rest on the edge, cursor slips 3 px up and back (ShowDelay)"),
+    ("edge-sweep", 900, "mouse keeps moving left/right along the edge (ShowDelay)"),
+    ("edge-wobble", 900, "same, drifting up to 15 px up and down (ShowDelay)"),
+    ("edge-pull", 900, "real mouse: pull down past the edge, keep pushing"),
+    ("edge-pull-sweep", 900, "real mouse: pull down, then left/right pressing down"),
 ]
 
 user32 = ctypes.windll.user32
@@ -204,6 +210,70 @@ def analyse(name, flyout, frames, top, kymo):
     return fails, notes
 
 
+def analyse_edge(path, slack=100):
+    """edge scenario: the bar must come up when the cursor rests on the edge,
+    go away after leaving, and the real bar must never show out of place
+    (Explorer's own auto-hide slide next to ours = a second taskbar)"""
+    fails, notes = [], []
+    top, sh, phases = None, None, []
+    with open(path) as f:
+        for line in f:
+            if line.startswith("scenario"):
+                top = int(re.search(r"bar (-?\d+),(-?\d+)", line)[2])
+                sh = int(re.search(r"screen \d+x(\d+)", line)[1])
+            elif line.startswith("--"):
+                k = line.split()
+                phases.append((k[0][2:], int(k[1]), int(k[2]) if len(k) > 2 else 900, []))
+            else:
+                m = LINE.match(line)
+                c = re.search(r"cur=(-?\d+),(-?\d+)", line)
+                if m and phases:
+                    phases[-1][3].append(dict(t=float(m[1]), y=int(m[3]), v=int(m[4]), a=int(m[5]),
+                                              ov=bool(OV.findall(m[6])),
+                                              cy=int(c[2]) if c else None))
+    if top is None or not phases:
+        return ["no data"], notes
+    stuck = hidden = shift = 0
+    delay = ini_int("ShowDelay", 0)
+    starts = []
+    for kind, cycle, ms, fr in phases:
+        if not fr:
+            continue
+        # from a fully hidden bar: time from the cursor reaching the bottom row
+        # (as recorded per frame) to the real bar being placed (= slide starts)
+        if kind == "in" and ms > 700 and not fr[0]["v"] and not fr[0]["ov"]:
+            touch = next((x["t"] for x in fr if x["cy"] is None or x["cy"] >= sh - 1), None)
+            s = next((x["t"] - touch for x in fr if x["v"]), None) if touch is not None else None
+            if s is not None:
+                starts.append(max(s, 0))
+        last = fr[-1]
+        live = last["v"] and last["a"] == 255 and last["y"] == top and not last["ov"]
+        if kind == "in" and ms > 700 and not live:
+            stuck += 1
+        if kind == "out" and ms > 700 and (last["ov"] or (last["v"] and last["a"] > 1)):
+            hidden += 1
+        # a few pixels for a frame or two is the time it takes to notice
+        # Explorer moving the bar; more is a visible second taskbar
+        if any(x["v"] and x["a"] > 1 and x["y"] - top > 12 for x in fr):
+            shift += 1
+    if stuck:
+        fails.append("bar did not come up in %d edge touches" % stuck)
+    if hidden:
+        fails.append("bar not hidden after leaving in %d cases" % hidden)
+    if shift:
+        fails.append("real bar visible out of place in %d phases" % shift)
+    # the slide must start ShowDelay after the touch, every time (the timer ticks
+    # in 16 ms steps). A cursor wobbling up and down may first have to come
+    # back near the edge.
+    late = [s for s in starts if s > delay + slack]
+    if late:
+        fails.append("slide started late (%s ms, ShowDelay=%d)" % (", ".join("%.0f" % s for s in late), delay))
+    notes.append("ShowDelay=%d, %d edge touches, slide starts after %s ms" % (
+        delay, sum(1 for p in phases if p[0] == "in"),
+        "%.0f-%.0f" % (min(starts), max(starts)) if starts else "-"))
+    return fails, notes
+
+
 def save_png(bmp, png):
     try:
         from PIL import Image
@@ -229,7 +299,7 @@ def main():
     print("Hands off the mouse and keyboard: %d scenario(s)...\n" % len(todo))
     failed = 0
     for name, period, desc in todo:
-        tag = name + ("-%d" % period if period else "")
+        tag = name + ("-%d" % period if period and period > 0 else "")
         prefix = os.path.join(OUT, tag)
         cmd = [PROBE, name, prefix] + ([str(period)] if period else [])
         r = subprocess.run(cmd)
@@ -238,10 +308,13 @@ def main():
             print("%-14s ERROR (probe exit %d)" % (tag, r.returncode))
             failed += 1
             continue
-        frames, top = read_log(prefix + ".log")
-        kymo = read_bmp(prefix + ".bmp")
-        fails, notes = analyse(name, name.startswith(("qs", "cal")), frames, top, kymo)
-        save_png(prefix + ".bmp", prefix + ".png")
+        if name.startswith("edge"):
+            fails, notes = analyse_edge(prefix + ".log", 160 if name == "edge-wobble" else 100)
+        else:
+            frames, top = read_log(prefix + ".log")
+            kymo = read_bmp(prefix + ".bmp")
+            fails, notes = analyse(name, name.startswith(("qs", "cal")), frames, top, kymo)
+            save_png(prefix + ".bmp", prefix + ".png")
         print("%-14s %s  - %s" % (tag, "PASS" if not fails else "FAIL", desc))
         for n in notes:
             print("               " + n)

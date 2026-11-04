@@ -19,6 +19,7 @@
 #define _WIN32_WINNT 0x0501
 #include <windows.h>
 #include <shellapi.h>
+#include <shlobj.h>
 
 #ifndef ABM_SETSTATE
 #define ABM_SETSTATE 10
@@ -113,11 +114,13 @@ static int   g_origAutoHide;
 static int   g_mode = M_HIDDEN;
 static volatile LONG g_evalPosted;
 static volatile LONG g_dragInside;
-static int   g_showPending;
+static int   g_showPending;     /* show delay counting (or over, see inBarArea) */
+static DWORD g_showSince;       /* ... since this tick */
 static POINT g_hookPt;          /* last point seen by the mouse hook (main thread) */
 static int   g_hookFresh;
 static int   g_reevalLeft;
 static void killShow(void);
+static int cursorOnBar(POINT pt);
 
 #ifdef FB_DEBUG
 static void dbg(const char *fmt, ...)
@@ -228,12 +231,18 @@ static int getAutoHide(void)
     APPBARDATA ab = { sizeof ab };
     return (SHAppBarMessage(ABM_GETSTATE, &ab) & ABS_AUTOHIDE) ? 1 : 0;
 }
+/* the auto-hide state we set last: a different state means the user changed
+   it (Settings > Taskbar), see autoHideChangedByUser() */
+static int g_lastAutoHide = -1, g_settingAutoHide;
 static void setAutoHide(int on)
 {
     APPBARDATA ab = { sizeof ab };
     ab.hWnd = g_tb;
     ab.lParam = on ? ABS_AUTOHIDE : ABS_ALWAYSONTOP;
+    g_lastAutoHide = on;
+    g_settingAutoHide = 1;      /* Explorer's broadcasts can arrive during the call */
     SHAppBarMessage(ABM_SETSTATE, &ab);
+    g_settingAutoHide = 0;
 }
 
 static void updateGeometry(void)
@@ -271,6 +280,42 @@ static int atEdge(POINT pt)
     case ABE_LEFT:  return pt.x < g_mon.left + cfgTriggerPx;
     case ABE_RIGHT: return pt.x >= g_mon.right - cfgTriggerPx;
     default:        return pt.y >= g_mon.bottom - cfgTriggerPx;
+    }
+}
+
+/* Show delay and a moving hand: the cursor touches the edge, then wanders a
+   few pixels (resting hand) or more (moving the mouse left and right along the
+   bottom) off it and back. None of that may restart the delay, or the bar only
+   comes up once the mouse is held still. So the delay counts from the first
+   touch for as long as the cursor stays over the (hidden) bar's area, and only
+   leaving that area cancels it.
+   When the delay is over, the bar comes up if the cursor is at the edge or
+   within 1/8 of the bar's thickness of it (a resting hand); otherwise as soon
+   as it touches the edge again. */
+static int inBarArea(POINT pt)
+{
+    if (pt.x < g_mon.left || pt.x >= g_mon.right || pt.y < g_mon.top || pt.y >= g_mon.bottom)
+        return 0;
+    switch (g_edge) {
+    case ABE_TOP:   return pt.y < g_shown.bottom;
+    case ABE_LEFT:  return pt.x < g_shown.right;
+    case ABE_RIGHT: return pt.x >= g_shown.left;
+    default:        return pt.y >= g_shown.top;
+    }
+}
+static int nearEdge(POINT pt)
+{
+    int band = (g_edge == ABE_LEFT || g_edge == ABE_RIGHT ? g_shown.right - g_shown.left
+                                                           : g_shown.bottom - g_shown.top) / 8;
+    if (band < 2) band = 2;
+    band += cfgTriggerPx;
+    if (pt.x < g_mon.left || pt.x >= g_mon.right || pt.y < g_mon.top || pt.y >= g_mon.bottom)
+        return 0;
+    switch (g_edge) {
+    case ABE_TOP:   return pt.y < g_mon.top + band;
+    case ABE_LEFT:  return pt.x < g_mon.left + band;
+    case ABE_RIGHT: return pt.x >= g_mon.right - band;
+    default:        return pt.y >= g_mon.bottom - band;
     }
 }
 
@@ -699,6 +744,7 @@ static int contentShown(void)
 /* start a slide-in from fully hidden */
 static void startShow(void)
 {
+    DBG(("startShow t=%lu\r\n", GetTickCount()));
     if (cfgShowAnimMs <= 0) {
         tbAlphaRestore();
         showRealFull();
@@ -801,6 +847,7 @@ static void maskNativeUnhide(void)
     capture(&a_coverBg, g_shown.left, g_shown.top);
     a_carrier = C_COMP;
     a_realUnder = 1;
+    a_explSeen = 0;                    /* see guard(): the cursor may leave meanwhile */
     a_showStart = GetTickCount();
     a_revealAt = a_showStart + REVEAL_MS;
     if (!coverOn()) a_carrier = C_REAL;
@@ -849,6 +896,15 @@ static void animate(void)
                    a slide-in in progress just finishes */
                 if (a_carrier == C_REAL) realToSnapHold();
                 else if (a_carrier == C_COMP) realUnder(1);
+                else if (a_carrier == C_SNAP && a_p >= 1.0 && !a_realUnder && g_wantLayer) {
+                    /* a hide reversed, the picture is back up, but a flyout
+                       keeps the bar up while the cursor is away. Only Explorer
+                       hiding the bar by itself ends that (guard), and it can
+                       only do so if the bar is there: put the real bar under
+                       the picture, invisible, as realToSnapHold() leaves it */
+                    realUnder(1);
+                    a_explSeen = 0;
+                }
             } else if (a_carrier == C_SNAP && a_p >= 1.0) {
                 if (a_realUnder && realAtFull() && contentShown()) {
                     /* came back while the real bar is still in place: drop the picture */
@@ -949,15 +1005,25 @@ static void guard(void)
         /* let Explorer finish its own hide animation before hiding the window */
         if (IsWindowVisible(g_tb) && (LONG)(GetTickCount() - a_explorerHideUntil) >= 0)
             ShowWindow(g_tb, SW_HIDE);
-    } else if (a_carrier == C_SNAP && a_realUnder && g_desired == D_HOLD && !a_explSeen) {
-        /* bar frozen into a picture (cursor away, flyout open): if Explorer
-           starts hiding the (invisible) real bar, tell the main thread, which
-           then hides the bar the normal FastBar way */
+    } else if ((a_carrier == C_SNAP || a_carrier == C_COMP) && a_realUnder &&
+               g_desired == D_HOLD && !a_explSeen) {
+        /* bar frozen into a picture (cursor away, flyout open), or still under
+           the cover (maskNativeUnhide) when the cursor went away: if Explorer
+           hides / has hidden the (invisible) real bar, tell the main thread,
+           which then hides the bar the normal FastBar way */
         RECT r;
         if (IsWindowVisible(g_tb) && GetWindowRect(g_tb, &r) &&
             (r.left - g_shown.left) * g_offX + (r.top - g_shown.top) * g_offY > 0) {
             a_explSeen = 1;
             DBG(("guard: explorer hides frozen bar t=%lu\r\n", GetTickCount()));
+            /* Without a flyout the real bar is still opaque, and Explorer keeps
+               it above our picture: its own 30 fps slide would show as a second
+               taskbar. The picture already shows the bar where it was, so take
+               the real one off screen now (with a flyout it is invisible). */
+            if (!g_wantLayer && a_carrier == C_SNAP) {
+                ShowWindow(g_tb, SW_HIDE);
+                a_realUnder = 0;
+            }
             PostMessageW(g_hwnd, WM_APP_EXPLHID, 1, 0);
         }
     } else if (a_carrier == C_REAL && a_p >= 1.0 && g_desired == D_SHOWN) {
@@ -971,8 +1037,13 @@ static void guard(void)
             long full = g_offX * g_offX + g_offY * g_offY;
             DBG(("guard moved dx=%ld dy=%ld along=%ld full=%ld precap=%d age=%lu t=%lu\r\n", dx, dy, along, full,
                  a_precapOk, GetTickCount() - a_precapAt, GetTickCount()));
-            if (along * 4 >= full * 3) {
-                /* jumped (almost) all the way: Explorer restarts its own unhide */
+            POINT pt;
+            GetCursorPos(&pt);
+            if (along * 4 >= full * 3 || (along > 0 && cursorOnBar(pt))) {
+                /* jumped (almost) all the way: Explorer restarts its own unhide.
+                   Or Explorer started its own hide just as the cursor came back
+                   onto the bar: it brings the bar back by itself. Either way,
+                   cover it until it is back in place. */
                 maskNativeUnhide();
                 SetEvent(g_evt);
             } else if (along > 0 && a_precapOk &&
@@ -1069,6 +1140,7 @@ static DWORD WINAPI AnimThread(LPVOID unused)
 
 static void setDesired(LONG d)
 {
+    DBG(("setDesired %ld mode=%d t=%lu\r\n", d, g_mode, GetTickCount()));
     InterlockedExchange(&g_desired, d);
     SetEvent(g_evt);
 }
@@ -1146,6 +1218,7 @@ static void killShow(void) { KillTimer(g_hwnd, TIMER_SHOW); g_showPending = 0; }
 
 static void showNow(void)
 {
+    DBG(("showNow pending=%d t=%lu\r\n", g_showPending, GetTickCount()));
     killShow();
     KillTimer(g_hwnd, TIMER_HIDE);
     g_mode = M_SHOWN;
@@ -1216,16 +1289,34 @@ static void evaluate(void)
     else GetCursorPos(&pt);
     fg = GetForegroundWindow();
     updatePolling(fg);
-    DBG(("eval pt=%ld,%ld mode=%d mon=%ld,%ld,%ld,%ld edge=%d at=%d full=%d\r\n", pt.x, pt.y, g_mode,
-         g_mon.left, g_mon.top, g_mon.right, g_mon.bottom, g_edge, atEdge(pt), fgIsFullscreen()));
+    DBG(("eval pt=%ld,%ld mode=%d mon=%ld,%ld,%ld,%ld edge=%d at=%d full=%d t=%lu\r\n", pt.x, pt.y, g_mode,
+         g_mon.left, g_mon.top, g_mon.right, g_mon.bottom, g_edge, atEdge(pt), fgIsFullscreen(),
+         GetTickCount()));
 
     if (g_mode == M_HIDDEN) {
         if (cfgShowOnStart && isStartOrSearch(fg)) { showNow(); return; }
         if (atEdge(pt) && !(cfgBlockFull && fgIsFullscreen())) {
             if (cfgShowDelay <= 0) showNow();
-            else if (!g_showPending) { g_showPending = 1; SetTimer(g_hwnd, TIMER_SHOW, cfgShowDelay, NULL); }
-        } else {
-            killShow();
+            else if (g_showPending && (LONG)(GetTickCount() - g_showSince) >= cfgShowDelay)
+                showNow();          /* delay over (the timer may also be late) */
+            else if (!g_showPending) {
+                /* While the cursor rests on the edge, Explorer's own auto-hide
+                   would "unhide" the (hidden) bar by itself, and then also hide
+                   it by itself when the cursor leaves: its 30 fps slide next to
+                   ours (a second taskbar). Mark the bar "shown" for Explorer
+                   right away, as a FastBar show does; the window itself stays
+                   hidden until the delay ends. Explorer can still start its own
+                   hide now and then; guard() takes the real bar away then. */
+                syncExplorerShown();
+                g_showPending = 1;
+                g_showSince = GetTickCount();
+                SetTimer(g_hwnd, TIMER_SHOW, cfgShowDelay, NULL);
+                DBG(("show delay starts pt=%ld,%ld t=%lu\r\n", pt.x, pt.y, GetTickCount()));
+            }
+        } else if (!(g_showPending && inBarArea(pt) && !(cfgBlockFull && fgIsFullscreen()))) {
+            killShow();             /* left the bar's area: start over next time */
+        } else if ((LONG)(GetTickCount() - g_showSince) >= cfgShowDelay && nearEdge(pt)) {
+            showNow();              /* delay over, cursor back near the edge */
         }
         return;
     }
@@ -1282,17 +1373,35 @@ static void evaluate(void)
     }
 }
 
+/* A mouse moves by relative steps, and the hook gets the new point before
+   Windows stops the cursor at the screen's edge: pulling the mouse down onto
+   the bottom edge (or pushing down while moving along it) reports points
+   below the screen. Put the point where the cursor will really be, the
+   nearest point on a monitor, or none of them counts as "at the edge". */
+static POINT onScreen(POINT pt)
+{
+    MONITORINFO mi = { sizeof mi };
+    if (MonitorFromPoint(pt, MONITOR_DEFAULTTONULL)) return pt;
+    if (!GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi)) return pt;
+    if (pt.x < mi.rcMonitor.left) pt.x = mi.rcMonitor.left;
+    if (pt.x >= mi.rcMonitor.right) pt.x = mi.rcMonitor.right - 1;
+    if (pt.y < mi.rcMonitor.top) pt.y = mi.rcMonitor.top;
+    if (pt.y >= mi.rcMonitor.bottom) pt.y = mi.rcMonitor.bottom - 1;
+    return pt;
+}
+
 static LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp)
 {
     if (code == HC_ACTION && g_enabled) {
         MSLLHOOKSTRUCT *m = (MSLLHOOKSTRUCT *)lp;
+        POINT pt = onScreen(m->pt);
         int relevant;
-        g_hookPt = m->pt;
+        g_hookPt = pt;
         g_hookFresh = 1;
         if (wp == WM_LBUTTONDOWN)
-            g_dragInside = (g_mode != M_HIDDEN) && PtInRect(&g_shown, m->pt);
+            g_dragInside = (g_mode != M_HIDDEN) && PtInRect(&g_shown, pt);
         /* while hidden only the screen edge matters: skip everything else */
-        relevant = (g_mode != M_HIDDEN) || atEdge(m->pt) || cfgShowDelay > 0;
+        relevant = (g_mode != M_HIDDEN) || atEdge(pt) || cfgShowDelay > 0;
         if (relevant && !InterlockedExchange(&g_evalPosted, 1))
             PostMessageW(g_hwnd, WM_APP_EVAL, 0, 0);
     }
@@ -1389,40 +1498,29 @@ static void setEnabled(int on)
     else { mouseHook(0); restoreTaskbar(); }
 }
 
+/* "Automatically hide the taskbar" was switched in Settings while we run.
+   Off: the user wants a normal taskbar, so step aside (otherwise the bar stays
+   hidden by us and its reserved space shows as an empty strip). On: take over
+   again. Either way it becomes the setting restored on exit. */
+static void autoHideChangedByUser(void)
+{
+    int cur;
+    if (g_settingAutoHide || g_lastAutoHide < 0) return;
+    cur = getAutoHide();
+    if (cur == g_lastAutoHide) return;
+    g_lastAutoHide = cur;
+    g_origAutoHide = cur;
+    iniSetInt(L"OriginalAutoHide", cur);
+    if (!cur && g_enabled) setEnabled(0);
+    else if (cur && !g_enabled) setEnabled(1);
+}
+
 /* ---------- tray icon ---------- */
+/* the logo is embedded as icon resource 1 (fastbar.rc -> assets/FastBar.ico) */
 static HICON makeIcon(void)
 {
-    int s = GetSystemMetrics(SM_CXSMICON), x, y;
-    BITMAPINFO bi = { { sizeof(BITMAPINFOHEADER) } };
-    DWORD *px;
-    ICONINFO ii = { TRUE };
-    HICON ic;
-    HDC dc = GetDC(NULL);
-    bi.bmiHeader.biWidth = s;
-    bi.bmiHeader.biHeight = -s;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    ii.hbmColor = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
-    ii.hbmMask = CreateBitmap(s, s, 1, 1, NULL);
-    ReleaseDC(NULL, dc);
-    for (y = 0; y < s; y++)
-        for (x = 0; x < s; x++) {
-            DWORD c = 0;
-            int m = s / 8 + 1;
-            int frame = (x >= 0 && x < s && y >= m && y < s - m) &&
-                        (x < 2 || x >= s - 2 || y < m + 2 || y >= s - m - 2);
-            int bar = x >= 3 && x < s - 3 && y >= s - m - 2 - s / 4 && y < s - m - 3;
-            int arrow = (y >= m + 3 && y < m + 3 + s / 4) &&
-                        (x >= s / 2 - (y - m - 3) - 1 && x <= s / 2 + (y - m - 3));
-            if (frame) c = 0xFFFFFFFF;
-            else if (bar) c = 0xFF3C9BFF;
-            else if (arrow) c = 0xFFFFFFFF;
-            px[y * s + x] = c;
-        }
-    ic = CreateIconIndirect(&ii);
-    DeleteObject(ii.hbmColor);
-    DeleteObject(ii.hbmMask);
-    return ic;
+    return (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1), IMAGE_ICON,
+                             GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
 }
 
 static HICON g_icon;
@@ -1500,12 +1598,24 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_APP_EXPLHID:          /* Explorer hid the bar on its own */
+        DBG(("explhid w=%d mode=%d t=%lu\r\n", (int)w, g_mode, GetTickCount()));
         if (w) {
             /* the bar is covered by its picture (frozen, or taken over by
                guard): hide it the normal way, the hide delay counted from
                when the cursor left the bar. Already leaving: nothing to do. */
             LONG rest = cfgHideDelay - (LONG)(GetTickCount() - g_leaveAt);
+            POINT pt;
             if (g_mode != M_SHOWN) return 0;
+            /* posted by the anim thread a moment ago: if the cursor has come
+               back onto the bar / the edge since, the show it started wins.
+               (Taking over here hid the bar with the cursor resting on the
+               edge, and with no further mouse event it never came back.) */
+            GetCursorPos(&pt);
+            if (cursorOnBar(pt)) {
+                /* the anim thread may have switched to "hold" itself: undo */
+                if (g_desired != D_SHOWN) setDesired(D_SHOWN);
+                return 0;
+            }
             killShow();
             g_explHid = 1;
             g_frozen = 0;
@@ -1520,6 +1630,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         g_explHid = 0;
         g_mode = M_HIDDEN;
         SetTimer(h, TIMER_EXPLHID, 650, NULL);  /* then hide the window for real */
+        PostMessageW(h, WM_APP_EVAL, 0, 0);     /* cursor already resting on the edge? */
         return 0;
     case WM_APP_EVAL:
         InterlockedExchange(&g_evalPosted, 0);
@@ -1532,7 +1643,6 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         KillTimer(h, w);
-        if (w == TIMER_SHOW) g_showPending = 0;
         if (w == TIMER_EXPLHID) {
             if (g_mode == M_HIDDEN) SetEvent(g_evt);   /* guard hides the window */
             return 0;
@@ -1546,7 +1656,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_SHOW) {
             POINT pt;
             GetCursorPos(&pt);
-            if (g_mode == M_HIDDEN && atEdge(pt)) showNow();
+            /* delay over: up now if the cursor is (about) at the edge; else
+               g_showPending stays set and evaluate() shows the bar as soon as
+               the cursor touches the edge again (or forgets it once the cursor
+               leaves the bar's area) */
+            if (g_mode == M_HIDDEN && nearEdge(pt)) showNow();
+            else if (g_mode != M_HIDDEN) g_showPending = 0;
         } else if (w == TIMER_HIDE && g_mode == M_LEAVING) {
             POINT pt;
             GetCursorPos(&pt);
@@ -1566,8 +1681,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_APP_TRAY:
         if (l == WM_RBUTTONUP || l == WM_LBUTTONUP) showMenu();
         return 0;
-    case WM_DISPLAYCHANGE:
     case WM_SETTINGCHANGE:
+        autoHideChangedByUser();
+        /* fall through */
+    case WM_DISPLAYCHANGE:
     case WM_DPICHANGED:
         if (g_enabled && g_tb) {
             updateGeometry();
@@ -1707,6 +1824,46 @@ static void startGuard(void)
     launchSelf(L"--spawn-watch", GetCurrentProcessId());
 }
 
+/* Keep "Start menu\Programs\FastBar.lnk" pointing at this exe, so FastBar can be
+   found with Windows Search / the Start menu. Rewritten only when missing or
+   when the exe was moved. */
+static void ensureStartMenuShortcut(void)
+{
+    WCHAR lnk[MAX_PATH], cur[MAX_PATH], dir[MAX_PATH], *p, *slash;
+    IShellLinkW *sl = NULL;
+    IPersistFile *pf = NULL;
+    int ok = 0;
+
+    if (SHGetFolderPathW(NULL, CSIDL_PROGRAMS, NULL, 0, lnk) != S_OK) return;
+    if (lstrlenW(lnk) + 13 >= MAX_PATH) return;
+    lstrcatW(lnk, L"\\FastBar.lnk");
+    if (FAILED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED))) return;
+    if (SUCCEEDED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                   &IID_IShellLinkW, (void **)&sl)) &&
+        SUCCEEDED(sl->lpVtbl->QueryInterface(sl, &IID_IPersistFile, (void **)&pf))) {
+        cur[0] = 0;
+        if (GetFileAttributesW(lnk) != INVALID_FILE_ATTRIBUTES &&
+            SUCCEEDED(pf->lpVtbl->Load(pf, lnk, STGM_READ)) &&
+            SUCCEEDED(sl->lpVtbl->GetPath(sl, cur, MAX_PATH, NULL, 0)))
+            ok = lstrcmpiW(cur, g_exePath) == 0;
+        if (!ok) {
+            lstrcpyW(dir, g_exePath);
+            slash = dir;
+            for (p = dir; *p; p++) if (*p == L'\\') slash = p;
+            *slash = 0;
+            sl->lpVtbl->SetPath(sl, g_exePath);
+            sl->lpVtbl->SetArguments(sl, L"");
+            sl->lpVtbl->SetWorkingDirectory(sl, dir);
+            sl->lpVtbl->SetIconLocation(sl, g_exePath, 0);
+            sl->lpVtbl->SetDescription(sl, L"Responsive auto-hide taskbar");
+            pf->lpVtbl->Save(pf, lnk, TRUE);
+        }
+    }
+    if (pf) pf->lpVtbl->Release(pf);
+    if (sl) sl->lpVtbl->Release(sl);
+    CoUninitialize();
+}
+
 static void setIniPath(void)
 {
     WCHAR *slash, *p;
@@ -1745,6 +1902,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
     SetUnhandledExceptionFilter(CrashHandler);
 
     loadSettings();
+    ensureStartMenuShortcut();
 
     {
         HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
@@ -1760,10 +1918,12 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
     /* remember the user's own auto-hide setting (survives a crash via the ini) */
     if (iniInt(L"Running", 0)) g_origAutoHide = iniInt(L"OriginalAutoHide", 0);
     else { g_origAutoHide = getAutoHide(); iniSetInt(L"OriginalAutoHide", g_origAutoHide); }
+    g_lastAutoHide = getAutoHide();
 
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     wc.lpfnWndProc = MainProc;
     wc.hInstance = hi;
+    wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
     wc.lpszClassName = L"FastBarMain";
     RegisterClassW(&wc);
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, APP_NAME, 0, 0, 0, 0, 0, NULL, NULL, hi, NULL);

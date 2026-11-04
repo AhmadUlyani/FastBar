@@ -11,6 +11,24 @@
  *   qs-rapid / cal-rapid
  *              like qs / cal, then go in and out every period_ms (default 200)
  *              for 2 s, ending outside
+ *   edge       from a hidden bar: rest the cursor on the bottom edge for
+ *              period_ms (default 900), then leave for 900 ms; 6 times.
+ *              period_ms < 0: 20 times, resting a random 50-1200 ms on the
+ *              edge and a random 80-900 ms away from it.
+ *   edge-jitter
+ *              like edge, but the cursor slips 3 px up off the edge 60 ms
+ *              after touching it and goes back down 40 ms later (a hand)
+ *   edge-sweep like edge, but the mouse keeps moving left and right (1000
+ *              reports a second) on the edge, then in the middle of the screen
+ *   edge-wobble
+ *              like edge-sweep, but moving along the edge the cursor also
+ *              drifts up to 15 px up and back down, as a hand does
+ *   edge-pull  a real mouse: relative moves, pulled down quickly past the edge
+ *              and kept pushing down (the hook sees points below the screen)
+ *   edge-pull-sweep
+ *              pulled down, then moved left/right while pressing down a bit
+ *              Exercises ShowDelay (Explorer's own auto-hide also reacts to a
+ *              cursor resting on the edge)
  * writes <outprefix>.log (one line per frame) and <outprefix>.bmp (kymograph)
  *
  * log line: "<ms> tb=<x>,<y> v<visible> a<alpha> [ov=<x>,<y> v1 a<alpha>]..."
@@ -86,6 +104,123 @@ static void saveBmp(const char *path, HDC dc, HBITMAP bmp, int w, int h)
     free(px);
 }
 
+/* sweep: a mouse moved left and right, reporting 1000 times a second, at row
+   g_sweepY (-1 = stopped) */
+static volatile LONG g_sweepY = -1;
+static int g_sweepWobble;
+/* g_sweepRel: like a real mouse, relative moves (which can push past the
+   screen edge): g_sweepDx left/right, g_sweepDy down, per report */
+static int g_sweepRel, g_sweepDx, g_sweepDy;
+static void moveBy(int dx, int dy)
+{
+    INPUT in = { 0 };
+    in.type = INPUT_MOUSE;
+    in.mi.dx = dx;
+    in.mi.dy = dy;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE;
+    SendInput(1, &in, sizeof in);
+}
+static DWORD WINAPI sweepThread(LPVOID p)
+{
+    LARGE_INTEGER fq, a, b;
+    int x = SW / 3, dir = 3, n = 0, w, k = 0;
+    (void)p;
+    QueryPerformanceFrequency(&fq);
+    for (;;) {
+        LONG y = g_sweepY;
+        if (y >= 0 && g_sweepRel && y == SH - 1) {
+            if (++k % 200 == 0) g_sweepDx = -g_sweepDx;
+            moveBy(g_sweepDx, g_sweepDy);
+        } else if (y >= 0) {
+            x += dir;
+            if (x > SW / 3 + 300 || x < SW / 3 - 300) dir = -dir;
+            /* g_sweepWobble: the hand also drifts up to that many pixels up
+               and back down (triangle, 240 ms period) */
+            n = (n + 1) % 240;
+            w = g_sweepWobble * (n < 120 ? n : 240 - n) / 120;
+            moveTo(x, y == SH - 1 ? y - w : y);
+        }
+        QueryPerformanceCounter(&a);
+        do QueryPerformanceCounter(&b); while ((b.QuadPart - a.QuadPart) * 1000 < fq.QuadPart);
+    }
+    return 0;
+}
+
+/* edge scenario: no kymograph, one log line per frame, "--in"/"--out" markers
+   jitter: 1 = the cursor slips off the edge and back, 2 = the mouse keeps
+   moving left/right the whole time (on the edge, then in the middle) */
+static int edgeScenario(const char *out, int dwell, int jitter)
+{
+    char path[600];
+    FILE *f;
+    HWND tb = FindWindowW(L"Shell_TrayWnd", NULL);
+    RECT tr;
+    LARGE_INTEGER fq, t0, t;
+    int x = SW / 3, cycle, inside, cycles = dwell < 0 ? 20 : 6, d, j;
+    double ms, next, start;
+    moveTo(x, SH / 2); Sleep(1500);            /* start hidden */
+    if (jitter == 2) CreateThread(NULL, 0, sweepThread, NULL, 0, NULL);
+    sprintf(path, "%s.log", out);
+    f = fopen(path, "w");
+    if (!f) return 3;
+    GetWindowRect(tb, &tr);
+    fprintf(f, "scenario edge screen %dx%d bar %d,%d,%d,%d dwell %d\n", SW, SH,
+            (int)tr.left, (int)(SH - (tr.bottom - tr.top)), (int)tr.right, SH, dwell);
+    QueryPerformanceFrequency(&fq);
+    QueryPerformanceCounter(&t0);
+    srand(12345);                              /* same "random" run every time */
+    for (cycle = 0; cycle < cycles; cycle++) {
+        d = dwell < 0 ? 50 + rand() % 1150 : dwell;
+        for (inside = 1; inside >= 0; inside--) {
+            QueryPerformanceCounter(&t);
+            ms = (t.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart;
+            InterlockedExchange(&g_sweepY, -1);
+            if (inside && g_sweepRel) {
+                /* a quick pull down: relative moves, the last ones far past
+                   the edge (the cursor stops on it) */
+                int k;
+                for (k = 0; k < 12; k++) { moveBy(0, 60); Sleep(4); }
+                fprintf(f, "--in %d %d\n", cycle, d);
+            } else if (inside) { glide(x, SH / 2, x, SH - 1, 40); fprintf(f, "--in %d %d\n", cycle, d); }
+            else {
+                if (dwell < 0) d = 80 + rand() % 820;  /* random: come back early too */
+                else d = 900;
+                glide(x, SH - 1, x, SH / 2, 40); fprintf(f, "--out %d %d\n", cycle, d);
+            }
+            if (jitter == 2) InterlockedExchange(&g_sweepY, inside ? SH - 1 : SH / 2);
+            next = ms + d;
+            start = -1;
+            j = 0;
+            do {
+                HWND h = NULL;
+                pFlush();
+                QueryPerformanceCounter(&t);
+                ms = (t.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart;
+                if (start < 0) start = ms;
+                /* a hand resting on the edge: the cursor slips up a few pixels
+                   and goes back down */
+                if (jitter == 1 && inside && j == 0 && ms - start >= 60) { moveTo(x, SH - 4); j = 1; }
+                if (jitter == 1 && inside && j == 1 && ms - start >= 100) { moveTo(x, SH - 1); j = 2; }
+                fprintf(f, "%7.1f", ms);
+                winInfo(f, tb, "tb");
+                while ((h = FindWindowExW(NULL, h, L"FastBarSnapshot", NULL)) != NULL)
+                    if (IsWindowVisible(h)) winInfo(f, h, "ov");
+                {
+                    POINT c;
+                    GetCursorPos(&c);
+                    fprintf(f, " cur=%d,%d", (int)c.x, (int)c.y);
+                }
+                fprintf(f, "\n");
+            } while (ms < next);
+        }
+    }
+    InterlockedExchange(&g_sweepY, -1);
+    Sleep(5);
+    fclose(f);
+    moveTo(SW / 2, SH / 2);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *sc = argc > 1 ? argv[1] : "app";
@@ -111,6 +246,21 @@ int main(int argc, char **argv)
     tb = FindWindowW(L"Shell_TrayWnd", NULL);
     if (!tb || !pFlush) { fprintf(stderr, "no taskbar / DwmFlush\n"); return 2; }
 
+    if (!strcmp(sc, "edge")) return edgeScenario(out, argc > 3 ? atoi(argv[3]) : 900, 0);
+    if (!strcmp(sc, "edge-jitter")) return edgeScenario(out, argc > 3 ? atoi(argv[3]) : 900, 1);
+    if (!strcmp(sc, "edge-sweep")) return edgeScenario(out, argc > 3 ? atoi(argv[3]) : 900, 2);
+    if (!strcmp(sc, "edge-wobble")) {
+        g_sweepWobble = 15;
+        return edgeScenario(out, argc > 3 ? atoi(argv[3]) : 900, 2);
+    }
+    if (!strcmp(sc, "edge-pull")) {           /* pull down and keep pushing */
+        g_sweepRel = 1; g_sweepDx = 0; g_sweepDy = 3;
+        return edgeScenario(out, argc > 3 ? atoi(argv[3]) : 900, 2);
+    }
+    if (!strcmp(sc, "edge-pull-sweep")) {     /* pull down, then left/right, pressing down */
+        g_sweepRel = 1; g_sweepDx = 3; g_sweepDy = 1;
+        return edgeScenario(out, argc > 3 ? atoi(argv[3]) : 900, 2);
+    }
     if (!strncmp(sc, "qs", 2)) flyout = 'A';
     else if (!strncmp(sc, "cal", 3)) flyout = 'N';
     back = strstr(sc, "-back") != NULL;
