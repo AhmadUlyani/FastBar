@@ -99,6 +99,21 @@ gcc -Os -s -Wall -mwindows fastbar.c -o FastBar.exe -lshell32 -lgdi32
 gcc -Os -s -Wall -mwindows guard.c -o FastBarGuard.exe -lshell32
 ```
 
+`build.bat` cannot overwrite `FastBar.exe` while it is running. `rebuild.bat`
+closes the running FastBar (the taskbar is restored), builds, and starts the
+new build.
+
+## Testing
+
+`python tests\run_tests.py` drives the real mouse and keyboard against the
+running FastBar (show the bar, open Quick Settings / the calendar, leave, come
+back, go in and out quickly) and records every frame of what is on screen. It
+fails when Explorer's own animation shows, when something shows through the
+frozen bar, or when the slide stalls. Keep your hands off the mouse while it
+runs. `--rebuild` runs `rebuild.bat` first; scenario names (`app`, `qs`, `cal`,
+`qs-back`, `qs-rapid`, `cal-rapid`) run only those. It needs gcc and Python 3,
+and assumes a bottom taskbar. Recordings go to `tests\out\`.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

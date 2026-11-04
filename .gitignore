@@ -2,3 +2,4 @@ FastBar.exe
 FastBarGuard.exe
 FastBar.ini
 *.o
+tests/out/

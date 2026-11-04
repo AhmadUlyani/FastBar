@@ -485,6 +485,24 @@ static void tbAlpha(BYTE a)
     SetLayeredWindowAttributes(g_tb, 0, a, LWA_ALPHA);
     g_tbAlpha = a;
 }
+/* While a flyout (Quick Settings, calendar...) is open, the bar is kept
+   layered at full opacity. Making a window layered waits for Explorer to
+   handle the style change, which takes a few frames while it is busy; then
+   the bar could show above our picture for those frames when it is frozen.
+   Already layered, only the alpha changes, which is immediate. */
+static volatile LONG g_wantLayer;
+static void tbPrelayer(void)
+{
+    if (!g_tb) return;
+    if (GetWindowLongW(g_tb, GWL_EXSTYLE) & WS_EX_LAYERED) {
+        if (g_tbAlpha != 255) tbAlpha(255);
+        return;
+    }
+    SetWindowLongW(g_tb, GWL_EXSTYLE, GetWindowLongW(g_tb, GWL_EXSTYLE) | WS_EX_LAYERED);
+    SetLayeredWindowAttributes(g_tb, 0, 255, LWA_ALPHA);
+    g_tbLayeredByUs = 1;
+    g_tbAlpha = 255;
+}
 /* give the window its original style back (on exit / when disabled) */
 static void tbAlphaRestore(void)
 {
@@ -655,11 +673,20 @@ static void realToSnap(void)
 /* cursor left a fully shown bar: freeze a picture of it on top, but leave the
    real bar shown underneath (click-through picture), so that coming back is
    instant - a re-shown bar needs a few frames to be redrawn by Explorer */
+static int a_explSeen;           /* Explorer's own hide already reported */
 static void realToSnapHold(void)
 {
     capture(&a_snapS, g_shown.left, g_shown.top);
     a_snapValid = 1;
     showOverlay(a_snap, g_shown.left, g_shown.top, a_snapS.w, a_snapS.h);
+    /* With a flyout open (Quick Settings / calendar) the real bar may sit
+       above our picture (higher z-band), and Explorer may start its own
+       30 fps hide: make it invisible so none of that shows. It is already
+       layered then (tbPrelayer), so this is immediate. Without a flyout the
+       picture covers the bar anyway, and changing its style would only make
+       the moving bar flash for a frame or two. */
+    if (g_wantLayer) tbAlpha(TB_INVISIBLE);
+    a_explSeen = 0;
     a_carrier = C_SNAP;                /* a_realUnder stays 1 */
 }
 
@@ -679,6 +706,16 @@ static void startShow(void)
         a_p = 1.0;
         a_carrier = C_REAL;
         return;
+    }
+    /* The real bar can still be on screen here: after Explorer hid it by itself
+       (cursor left while Quick Settings / the calendar was open) its own slow
+       hide animation runs for a while. Make it invisible before taking the
+       background, or the half-hidden bar ends up in the picture and shows up
+       as a second taskbar behind the sliding one. */
+    if (IsWindowVisible(g_tb)) {
+        tbAlpha(TB_INVISIBLE);
+        waitFrame();
+        waitFrame();
     }
     capture(&a_coverBg, g_shown.left, g_shown.top);   /* what is behind the bar */
     copySurface(&a_trueBg, &a_coverBg);
@@ -816,6 +853,7 @@ static void animate(void)
                 if (a_realUnder && realAtFull() && contentShown()) {
                     /* came back while the real bar is still in place: drop the picture */
                     tbAlphaRestore();
+                    waitFrame();               /* real bar opaque before the picture goes */
                     ShowWindow(a_snap, SW_HIDE);
                     a_carrier = C_REAL;
                 } else {
@@ -881,6 +919,28 @@ static void animate(void)
     }
 }
 
+/* Picture of the fully shown bar, taken when the cursor leaves it while the
+   bar stays up (e.g. Quick Settings / the calendar is open). If Explorer then
+   starts hiding the bar by itself, this picture lets FastBar play its own
+   hide (hide delay + smooth slide) instead of Explorer's fast 30 fps one. */
+static Surface a_precap;
+static DWORD   a_precapAt;
+static int     a_precapOk;
+static volatile LONG g_precapReq;
+#define PRECAP_MAX_AGE_MS 2000
+
+static void precapture(void)
+{
+    if (a_carrier == C_REAL && a_p >= 1.0 && realAtFull() && contentShown()) {
+        capture(&a_precap, g_shown.left, g_shown.top);
+        a_precapAt = GetTickCount();
+        a_precapOk = 1;
+        DBG(("precap ok t=%lu\r\n", a_precapAt));
+    } else {
+        DBG(("precap skip carrier=%d full=%d content=%d\r\n", a_carrier, realAtFull(), contentShown()));
+    }
+}
+
 /* keep things consistent if Explorer moves/shows the taskbar on its own */
 static void guard(void)
 {
@@ -889,18 +949,50 @@ static void guard(void)
         /* let Explorer finish its own hide animation before hiding the window */
         if (IsWindowVisible(g_tb) && (LONG)(GetTickCount() - a_explorerHideUntil) >= 0)
             ShowWindow(g_tb, SW_HIDE);
+    } else if (a_carrier == C_SNAP && a_realUnder && g_desired == D_HOLD && !a_explSeen) {
+        /* bar frozen into a picture (cursor away, flyout open): if Explorer
+           starts hiding the (invisible) real bar, tell the main thread, which
+           then hides the bar the normal FastBar way */
+        RECT r;
+        if (IsWindowVisible(g_tb) && GetWindowRect(g_tb, &r) &&
+            (r.left - g_shown.left) * g_offX + (r.top - g_shown.top) * g_offY > 0) {
+            a_explSeen = 1;
+            DBG(("guard: explorer hides frozen bar t=%lu\r\n", GetTickCount()));
+            PostMessageW(g_hwnd, WM_APP_EXPLHID, 1, 0);
+        }
     } else if (a_carrier == C_REAL && a_p >= 1.0 && g_desired == D_SHOWN) {
         RECT r;
-        tbAlphaRestore();
+        if (g_wantLayer) tbPrelayer();
+        else tbAlphaRestore();
         if (!IsWindowVisible(g_tb)) showRealFull();
         else if (GetWindowRect(g_tb, &r) && (r.left != g_shown.left || r.top != g_shown.top)) {
             long dx = r.left - g_shown.left, dy = r.top - g_shown.top;
             long along = dx * g_offX + dy * g_offY;          /* > 0: towards hidden */
             long full = g_offX * g_offX + g_offY * g_offY;
+            DBG(("guard moved dx=%ld dy=%ld along=%ld full=%ld precap=%d age=%lu t=%lu\r\n", dx, dy, along, full,
+                 a_precapOk, GetTickCount() - a_precapAt, GetTickCount()));
             if (along * 4 >= full * 3) {
                 /* jumped (almost) all the way: Explorer restarts its own unhide */
                 maskNativeUnhide();
                 SetEvent(g_evt);
+            } else if (along > 0 && a_precapOk &&
+                       GetTickCount() - a_precapAt < PRECAP_MAX_AGE_MS &&
+                       a_precap.w == g_shown.right - g_shown.left &&
+                       a_precap.h == g_shown.bottom - g_shown.top) {
+                /* Explorer started hiding the bar by itself: cover it with the
+                   picture taken while it was still fully shown, make the real
+                   bar invisible, and hide it the normal FastBar way */
+                a_precapOk = 0;
+                copySurface(&a_snapS, &a_precap);
+                a_snapValid = 1;
+                showOverlay(a_snap, g_shown.left, g_shown.top, a_snapS.w, a_snapS.h);
+                tbAlpha(TB_INVISIBLE);
+                a_realUnder = 0;
+                a_carrier = C_SNAP;
+                a_p = 1.0;
+                a_explorerHideUntil = GetTickCount() + 600;
+                InterlockedExchange(&g_desired, D_HOLD);
+                PostMessageW(g_hwnd, WM_APP_EXPLHID, 1, 0);
             } else if (along > 0) {
                 /* Explorer is hiding the bar by itself (e.g. the cursor went into
                    Quick Settings / the calendar). Its content is already sliding
@@ -967,6 +1059,7 @@ static DWORD WINAPI AnimThread(LPVOID unused)
         if (r == WAIT_OBJECT_0) {
             InterlockedExchange(&g_animIdle, 0);
             animate();
+            if (InterlockedExchange(&g_precapReq, 0)) precapture();
             guard();
             InterlockedExchange(&g_animIdle, 1);
         }
@@ -1023,6 +1116,32 @@ static int cursorInside(POINT pt)
     return 0;
 }
 
+/* the cursor is on the bar itself (not on one of its popups) */
+static int cursorOnBar(POINT pt)
+{
+    RECT r = g_shown;
+    InflateRect(&r, 1, 1);
+    if (PtInRect(&r, pt) || atEdge(pt)) return 1;
+    return g_dragInside && (GetAsyncKeyState(VK_LBUTTON) & 0x8000);
+}
+
+/* Explorer hid the bar by itself while Quick Settings / the calendar was open
+   and FastBar took over the hide: until the bar is shown again, only the bar
+   itself brings it back (the open flyout would just make Explorer hide it again) */
+static int g_explHid;
+static int g_onBar;
+static DWORD g_leaveAt;     /* when the cursor last left the bar */
+/* the cursor is away but an open flyout (Quick Settings, calendar, jump list...)
+   keeps the bar up: it is frozen into a picture (D_HOLD) while in M_SHOWN */
+static int g_frozen;
+
+/* should the bar stay up / come back? */
+static int wantShown(POINT pt, HWND fg)
+{
+    if (g_explHid) return cursorOnBar(pt);
+    return cursorInside(pt) || fgKeeps(fg);
+}
+
 static void killShow(void) { KillTimer(g_hwnd, TIMER_SHOW); g_showPending = 0; }
 
 static void showNow(void)
@@ -1030,6 +1149,8 @@ static void showNow(void)
     killShow();
     KillTimer(g_hwnd, TIMER_HIDE);
     g_mode = M_SHOWN;
+    g_frozen = 0;
+    g_explHid = 0;
     setDesired(D_SHOWN);
 }
 
@@ -1117,13 +1238,44 @@ static void evaluate(void)
         DBG(("  shown-branch inside=%d fgKeeps=%d fg=%s under=%s cloaked=%d\r\n", cursorInside(pt), fgKeeps(fg), c1, c2, isCloaked(r)));
     }
 #endif
-    if (cursorInside(pt) || fgKeeps(fg)) {
+    if (g_mode == M_SHOWN) {
+        /* cursor just left the bar: keep a picture of it, in case Explorer
+           starts hiding it by itself (see guard) */
+        int on = cursorOnBar(pt);
+        if (!on && g_onBar) {
+            g_leaveAt = GetTickCount();
+            InterlockedExchange(&g_precapReq, 1);
+            SetEvent(g_evt);
+        }
+        g_onBar = on;
+    }
+    {
+        /* a flyout is open: prepare the bar for a quick freeze (tbPrelayer) */
+        LONG wl = g_mode == M_SHOWN && fgKeeps(fg);
+        if (wl != g_wantLayer) {
+            InterlockedExchange(&g_wantLayer, wl);
+            SetEvent(g_evt);
+        }
+    }
+    if (wantShown(pt, fg)) {
         if (g_mode != M_SHOWN) {
             KillTimer(g_hwnd, TIMER_HIDE);
             g_mode = M_SHOWN;
+            g_explHid = 0;
+            g_frozen = 0;
+            g_onBar = cursorOnBar(pt);
             setDesired(D_SHOWN);
+        } else {
+            /* kept up only by an open flyout, cursor elsewhere: freeze the
+               bar into a picture; live again once the cursor is back */
+            int frz = !cursorInside(pt);
+            if (frz != g_frozen) {
+                g_frozen = frz;
+                setDesired(frz ? D_HOLD : D_SHOWN);
+            }
         }
     } else if (g_mode == M_SHOWN) {
+        g_frozen = 0;
         g_mode = M_LEAVING;
         if (cfgHideDelay <= 0) { g_mode = M_HIDDEN; setDesired(D_HIDDEN); }
         else { setDesired(D_HOLD); SetTimer(g_hwnd, TIMER_HIDE, cfgHideDelay, NULL); }
@@ -1209,6 +1361,9 @@ static void engage(void)
         a_p = 0.0;
     }
     g_mode = M_HIDDEN;
+    g_explHid = 0;
+    g_frozen = 0;
+    a_precapOk = 0;
     InterlockedExchange(&g_desired, D_HIDDEN);
     InterlockedExchange(&g_paused, 0);
     iniSetInt(L"Running", 1);
@@ -1345,8 +1500,24 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_APP_EXPLHID:          /* Explorer hid the bar on its own */
+        if (w) {
+            /* the bar is covered by its picture (frozen, or taken over by
+               guard): hide it the normal way, the hide delay counted from
+               when the cursor left the bar. Already leaving: nothing to do. */
+            LONG rest = cfgHideDelay - (LONG)(GetTickCount() - g_leaveAt);
+            if (g_mode != M_SHOWN) return 0;
+            killShow();
+            g_explHid = 1;
+            g_frozen = 0;
+            g_onBar = 0;
+            DBG(("explhid takeover rest=%ld\r\n", rest));
+            if (rest <= 0) { g_mode = M_HIDDEN; g_explHid = 0; setDesired(D_HIDDEN); }
+            else { g_mode = M_LEAVING; setDesired(D_HOLD); SetTimer(h, TIMER_HIDE, (UINT)rest, NULL); }
+            return 0;
+        }
         killShow();
         KillTimer(h, TIMER_HIDE);
+        g_explHid = 0;
         g_mode = M_HIDDEN;
         SetTimer(h, TIMER_EXPLHID, 650, NULL);  /* then hide the window for real */
         return 0;
@@ -1379,10 +1550,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         } else if (w == TIMER_HIDE && g_mode == M_LEAVING) {
             POINT pt;
             GetCursorPos(&pt);
-            if (cursorInside(pt) || fgKeeps(GetForegroundWindow())) {
+            if (wantShown(pt, GetForegroundWindow())) {
                 g_mode = M_SHOWN;
+                g_explHid = 0;
+                g_frozen = 0;
+                g_onBar = cursorOnBar(pt);
                 setDesired(D_SHOWN);
             } else {
+                g_explHid = 0;
                 g_mode = M_HIDDEN;
                 setDesired(D_HIDDEN);
             }
