@@ -16,7 +16,8 @@ about 30 fps, so the slide often stutters. FastBar replaces that behavior:
 
 ## Usage
 
-1. Keep `FastBar.exe` and `FastBarGuard.exe` in the same folder and run `FastBar.exe`.
+1. Keep `FastBar.exe`, `FastBarGuard.exe` and `FastBarTap.dll` in the same folder and run
+   `FastBar.exe`. (`FastBarTap.dll` is only needed for **Transparent taskbar**.)
    Its icon appears in the system tray.
    On launch FastBar adds itself to the Start menu (`FastBar.lnk` in your user's
    Start menu *Programs* folder), so next time you can just type "FastBar" in
@@ -26,6 +27,9 @@ about 30 fps, so the slide often stutters. FastBar replaces that behavior:
    Move away and it slides down.
 3. Click the tray icon for the menu:
    - **Enabled**: turn FastBar on or off. When off, the taskbar behaves normally.
+   - **Transparent taskbar**: see-through taskbar background, like TranslucentTB's
+     "clear" mode. The icons stay solid. Works whether FastBar is enabled or not, and
+     the original background comes back when you turn it off or exit FastBar.
    - **Start with Windows**
    - **Edit settings...** / **Reload settings**
    - **Exit**: restores the taskbar and your original auto-hide setting.
@@ -52,6 +56,8 @@ first run. After editing it, choose **Reload settings** from the tray menu.
 | `TriggerPixels` | 1 | how many pixels from the screen edge trigger the taskbar |
 | `BlockInFullscreen` | 1 | 1 = don't pop up over full-screen games or videos |
 | `ShowWithStartMenu` | 1 | 1 = show the taskbar while Start or Search is open |
+| `TransparentTaskbar` | 0 | 1 = see-through taskbar background (same as the tray menu item) |
+| `TaskbarColor` | 00000000 | background color while transparent, as `AARRGGBB` hex: `00000000` = fully clear, `66000000` = dark tint, `40FFFFFF` = light tint |
 
 ## How it works
 
@@ -89,6 +95,26 @@ first run. After editing it, choose **Reload settings** from the tray menu.
   guard is started detached, so ending FastBar's process tree does not end it too.
   Without `FastBarGuard.exe`, FastBar uses a second copy of itself (`FastBar.exe --watch`).
 
+- **Transparent taskbar.** Windows 11 draws the taskbar's background inside Explorer
+  (a XAML `Rectangle` named `BackgroundFill`, plus a 1 px `BackgroundStroke` line). Like
+  TranslucentTB, FastBar loads a small 64-bit DLL (`FastBarTap.dll`) into Explorer through
+  Windows' XAML diagnostics interface (`InitializeXamlDiagnosticsEx`, started with 64-bit
+  `rundll32`). The DLL only sets the `Fill` of those two rectangles, and puts Explorer's
+  own brush back when transparency is turned off, FastBar exits, or FastBar is killed (the
+  guard does it then). Once loaded, the DLL stays in Explorer until Explorer restarts.
+- **Slides of a see-through bar.** A picture of the bar taken from the screen would also
+  hold whatever is behind its clear background, and sliding it would drag that part of the
+  screen along. So the slide-in uses the live thumbnail on a see-through window, and the
+  picture used for hiding is taken twice, over a black and over a white backdrop placed
+  right behind the bar, which gives a picture of the bar alone with per-pixel alpha. While
+  that happens, an ordinary picture covers the bar on screen and is excluded from screen
+  captures (`WDA_EXCLUDEFROMCAPTURE`), so you never see the backdrop.
+
+- **Start closing with the cursor on the bar.** When Start or a flyout closes, Explorer
+  hides the bar by itself even with the cursor on it, content included, and cannot be
+  talked out of it. FastBar puts a picture in its place, makes the real bar invisible, and
+  shows it again at its place once that hide is over, so on screen nothing happens.
+
 ## Limitations
 
 - Only the main taskbar (primary monitor) is handled. Taskbars on other monitors are
@@ -100,6 +126,16 @@ first run. After editing it, choose **Reload settings** from the tray menu.
   animation. Touching the edge again brings it back with FastBar's slide.
 - To remove FastBar completely, also delete its Start menu shortcut:
   `%APPDATA%\Microsoft\Windows\Start Menu\Programs\FastBar.lnk`).
+- **Transparent taskbar:**
+  - Screen recorders and screen sharing (OBS, Teams, ...) can show a black / white strip
+    behind the taskbar for 2 frames when it starts hiding: they see the backdrop that the
+    picture covers on your monitor (see "Slides of a see-through bar").
+  - When the cursor goes in and out of the bar very quickly while Quick Settings or the
+    calendar is open, Explorer's own hide animation can show for a few frames.
+  - The DLL is locked while Explorer has it loaded. To replace it (new build), restart
+    Explorer, or sign out and in again.
+  - Building `FastBarTap.dll` needs a 64-bit gcc (mingw-w64); `build.bat` looks for it in
+    `D:\mingw64\bin` or in the `GCC64` environment variable.
 - If both FastBar and FastBarGuard are killed, the taskbar can stay hidden. Run FastBar
   again and choose **Exit**, or restart Windows Explorer.
 

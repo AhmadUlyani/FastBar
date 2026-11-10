@@ -57,11 +57,16 @@
 #define TIMER_REEVAL  3
 #define TIMER_EXPLHID 4
 #define TIMER_POLL    5
+#define TIMER_TAP     6
+#define TIMER_EXPLSYNC 7
+#define TIMER_GEOM    8
+#define WM_APP_GEOM   (WM_APP + 4)
 #define ID_ENABLE     100
 #define ID_STARTUP    101
 #define ID_SETTINGS   102
 #define ID_RELOAD     103
 #define ID_EXIT       104
+#define ID_TRANSPARENT 105
 
 /* desired states for the animation thread */
 #define D_HIDDEN 0
@@ -102,11 +107,13 @@ static int cfgEasing      = 1;
 static int cfgTriggerPx   = 1;
 static int cfgBlockFull   = 1;
 static int cfgShowOnStart = 1;
+static volatile LONG cfgTransparent = 0;  /* see-through taskbar background (FastBarTap.dll) */
+static DWORD cfgColor = 0;               /* its color, ARGB (0 = fully clear) */
 
 /* ---------- shared state ---------- */
 static HWND  g_hwnd, g_tb;
 static HHOOK g_mouseHook;
-static HWINEVENTHOOK g_fgHook, g_showHook, g_locHook;
+static HWINEVENTHOOK g_fgHook, g_showHook, g_locHook, g_menuHook;
 static UINT  g_msgTaskbarCreated;
 static WCHAR g_iniPath[MAX_PATH], g_exePath[MAX_PATH];
 static int   g_enabled = 1;
@@ -120,6 +127,7 @@ static POINT g_hookPt;          /* last point seen by the mouse hook (main threa
 static int   g_hookFresh;
 static int   g_reevalLeft;
 static void killShow(void);
+static void tapPin(int on);
 static int cursorOnBar(POINT pt);
 
 #ifdef FB_DEBUG
@@ -193,7 +201,11 @@ static void loadSettings(void)
             "; 1 = do not pop up over full-screen games / videos\r\n"
             "BlockInFullscreen=1\r\n"
             "; 1 = show the taskbar while Start / Search is open\r\n"
-            "ShowWithStartMenu=1\r\n";
+            "ShowWithStartMenu=1\r\n"
+            "; 1 = see-through taskbar background (also in the tray menu)\r\n"
+            "TransparentTaskbar=0\r\n"
+            "; its color as AARRGGBB hex: 00000000 = fully clear, 66000000 = dark tint\r\n"
+            "TaskbarColor=00000000\r\n";
         HANDLE f = CreateFileW(g_iniPath, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
         if (f != INVALID_HANDLE_VALUE) {
             DWORD n;
@@ -207,12 +219,28 @@ static void loadSettings(void)
     if (iniInt(L"ShowAnimationMs", -1) < 0) iniSetInt(L"ShowAnimationMs", 250);
     if (iniInt(L"HideAnimationMs", -1) < 0) iniSetInt(L"HideAnimationMs", 180);
     if (iniInt(L"Easing", -1) < 0) iniSetInt(L"Easing", 1);
+    if (iniInt(L"TransparentTaskbar", -1) < 0) iniSetInt(L"TransparentTaskbar", 0);
+    {
+        WCHAR c[32];
+        const WCHAR *q;
+        GetPrivateProfileStringW(APP_NAME, L"TaskbarColor", L"", c, 32, g_iniPath);
+        if (!c[0]) WritePrivateProfileStringW(APP_NAME, L"TaskbarColor", L"00000000", g_iniPath);
+        cfgColor = 0;
+        for (q = c; *q == L' ' || *q == L'#'; q++) ;
+        for (; *q; q++) {
+            int d = *q >= L'0' && *q <= L'9' ? *q - L'0' : *q >= L'a' && *q <= L'f' ? *q - L'a' + 10 :
+                    *q >= L'A' && *q <= L'F' ? *q - L'A' + 10 : -1;
+            if (d < 0) break;
+            cfgColor = cfgColor * 16 + (DWORD)d;
+        }
+    }
     cfgShowAnimMs  = iniInt(L"ShowAnimationMs", 250);
     cfgHideAnimMs  = iniInt(L"HideAnimationMs", 180);
     cfgEasing      = iniInt(L"Easing", 1);
     cfgTriggerPx   = iniInt(L"TriggerPixels", 1);
     cfgBlockFull   = iniInt(L"BlockInFullscreen", 1);
     cfgShowOnStart = iniInt(L"ShowWithStartMenu", 1);
+    InterlockedExchange(&cfgTransparent, iniInt(L"TransparentTaskbar", 0) ? 1 : 0);
     if (cfgShowDelay < 0) cfgShowDelay = 0;
     if (cfgHideDelay < 0) cfgHideDelay = 0;
     if (cfgShowAnimMs < 0) cfgShowAnimMs = 0;
@@ -269,6 +297,9 @@ static void updateGeometry(void)
     default:
         g_shown.bottom = g_mon.bottom; g_shown.top = g_mon.bottom - h; g_offY = h; break;
     }
+    DBG(("geometry tb=%ld,%ld,%ld,%ld mon=%ld,%ld,%ld,%ld shown=%ld,%ld,%ld,%ld t=%lu\r\n",
+         r.left, r.top, r.right, r.bottom, g_mon.left, g_mon.top, g_mon.right, g_mon.bottom,
+         g_shown.left, g_shown.top, g_shown.right, g_shown.bottom, GetTickCount()));
 }
 
 static int atEdge(POINT pt)
@@ -378,21 +409,58 @@ static int isStartOrSearch(HWND h)
     return r;
 }
 
-static int fgIsFullscreen(void)
+static int isFullscreenWnd(HWND f)
 {
-    HWND f = GetForegroundWindow();
     RECT r;
-    if (!f || classIs(f, kDesktopClasses) || IsZoomed(f) || !GetWindowRect(f, &r)) return 0;
+    if (!f || classIs(f, kDesktopClasses) || !GetWindowRect(f, &r)) return 0;
+    /* With auto-hide a maximized window covers the whole screen too, so it has
+       to be told apart: it has a title bar, or borders hanging off the screen.
+       A browser that was maximized before going full screen (YouTube) stays
+       "zoomed", but has neither. */
+    if (IsZoomed(f) && ((GetWindowLongW(f, GWL_STYLE) & WS_CAPTION) == WS_CAPTION ||
+                        r.left < g_mon.left || r.top < g_mon.top)) return 0;
     return r.left <= g_mon.left && r.top <= g_mon.top &&
            r.right >= g_mon.right && r.bottom >= g_mon.bottom;
+}
+static int fgIsFullscreen(void)
+{
+    return isFullscreenWnd(GetForegroundWindow());
+}
+
+/* the top normal window (below "always on top" ones, popups of the taskbar
+   and FastBar's own) is one that covers the screen like a full-screen one:
+   Windows then treats the bar differently (it goes below that window, and
+   Explorer may pull it away when a tray flyout opens) */
+static int fullscreenBehind(void)
+{
+    HWND w;
+    DWORD me = GetCurrentProcessId(), pid;
+    for (w = GetTopWindow(NULL); w; w = GetWindow(w, GW_HWNDNEXT)) {
+        if (!IsWindowVisible(w) || isCloaked(w)) continue;
+        if (GetWindowLongW(w, GWL_EXSTYLE) & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW)) continue;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid == me || classIs(w, kPopupClasses)) continue;
+        return isFullscreenWnd(w);
+    }
+    return 0;
+}
+
+/* Windows keeps the real bar below a full-screen window: shown there, it could
+   not be clicked, and a picture of it would hold what is on screen instead */
+static int blockedFull(void)
+{
+    return cfgBlockFull && fgIsFullscreen();
 }
 
 /* ===================================================================== */
 /* animation thread                                                       */
 /* ===================================================================== */
-typedef struct { HDC dc; HBITMAP bmp, old; int w, h; } Surface;
+typedef struct { HDC dc; HBITMAP bmp, old; int w, h; DWORD *bits; } Surface;  /* 32-bit top-down DIB */
 
 static HWND    a_snap;          /* picture of the taskbar that slides (bar sized) */
+static HWND    a_snapO, a_snapT; /* a_snap: opaque picture / with per-pixel alpha (a_tmode) */
+static HWND    a_back;          /* black / white backdrop for matteSnap() */
+static int     a_backWhite;
 static HWND    a_cover;         /* full bar area: background + sliding picture */
 static Surface a_snapS, a_coverBg;
 static Surface a_trueBg;        /* what was behind the bar at the last slide-in */
@@ -400,6 +468,30 @@ static void copySurface(Surface *dst, Surface *src);
 static void showOverlay(HWND h, int x, int y, int w, int hh);
 static void keepOverlayOnTop(void);
 static int     a_carrier = C_NONE;
+/* See-through taskbar (TransparentTaskbar=1): the bar's background is clear,
+   so a picture of it taken from the screen also holds whatever was behind it,
+   and sliding that picture would drag that part of the screen along. So
+   slides are drawn with the live thumbnail only, on a cover that is itself
+   see-through (color key), and pictures are only used where they stand
+   still. Latched while the bar is at rest, so a slide never switches modes. */
+static int     a_tmode;
+/* does the picture in a_snapS show what is behind it (matteSnap) or not?
+   Also put on the overlay windows as a window property for tests/probe.c,
+   which cannot see it otherwise: only an opaque overlay hides the real bar. */
+static int a_snapSeeThru;
+#define SEE_THRU_PROP L"FastBarSeeThrough"
+#define COVER_KEY RGB(255, 0, 255)
+static void ovAlpha(HWND h, BYTE a)
+{
+    if (h == a_snapT) {                /* per-pixel alpha window: only its overall alpha */
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, a, AC_SRC_ALPHA };
+        UpdateLayeredWindow(h, NULL, NULL, NULL, NULL, NULL, 0, &bf, ULW_ALPHA);
+    } else if (h == a_cover && a_tmode) {
+        SetLayeredWindowAttributes(h, COVER_KEY, a, LWA_COLORKEY | LWA_ALPHA);
+    } else {
+        SetLayeredWindowAttributes(h, 0, a, LWA_ALPHA);
+    }
+}
 static double  a_p = 0.0;       /* 0 = hidden, 1 = shown */
 static DWORD   a_explorerHideUntil;
 
@@ -450,19 +542,33 @@ static void pumpMessages(void)
     while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
 }
 
+static void surfAlloc(Surface *s, int w, int h)
+{
+    BITMAPINFO bi;
+    HDC sdc = GetDC(NULL);
+    if (s->bmp) { SelectObject(s->dc, s->old); DeleteObject(s->bmp); }
+    if (!s->dc) s->dc = CreateCompatibleDC(sdc);
+    ZeroMemory(&bi, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    s->bits = NULL;
+    s->bmp = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, (void **)&s->bits, NULL, 0);
+    s->old = SelectObject(s->dc, s->bmp);
+    s->w = w; s->h = h;
+    ReleaseDC(NULL, sdc);
+}
+
 /* copy the screen area (x, y, taskbar size) into a surface; off-screen parts stay black */
 static void capture(Surface *s, int x, int y)
 {
     int w = g_shown.right - g_shown.left, h = g_shown.bottom - g_shown.top;
     RECT cur, vis;
     HDC sdc = GetDC(NULL);
-    if (w != s->w || h != s->h || !s->bmp) {
-        if (s->bmp) { SelectObject(s->dc, s->old); DeleteObject(s->bmp); }
-        if (!s->dc) s->dc = CreateCompatibleDC(sdc);
-        s->bmp = CreateCompatibleBitmap(sdc, w, h);
-        s->old = SelectObject(s->dc, s->bmp);
-        s->w = w; s->h = h;
-    }
+    if (w != s->w || h != s->h || !s->bmp) surfAlloc(s, w, h);
     PatBlt(s->dc, 0, 0, w, h, BLACKNESS);
     SetRect(&cur, x, y, x + w, y + h);
     if (IntersectRect(&vis, &cur, &g_mon))
@@ -559,6 +665,27 @@ static void tbAlphaRestore(void)
     g_tbAlpha = 255;
 }
 
+/* Windows keeps the real bar below a window it takes for full screen (Riot
+   Client, a browser). Start lifts it, but when a tray flyout replaces Start the
+   bar is back below that window, while a click-through picture of ours still
+   shows it. Without the picture the bar would seem to vanish, under the cursor. */
+static int barCovered(void)
+{
+    POINT c;
+    HWND w;
+    c.x = (g_shown.left + g_shown.right) / 2;
+    c.y = (g_shown.top + g_shown.bottom) / 2;
+    w = GetAncestor(WindowFromPoint(c), GA_ROOT);
+    return w && w != g_tb && !(GetWindowLongW(w, GWL_EXSTYLE) & WS_EX_TOPMOST) &&
+           !classIs(w, kPopupClasses);
+}
+static void barRaise(void)
+{
+    if (barCovered())
+        SetWindowPos(g_tb, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                     SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
+}
+
 static void showRealFull(void)
 {
     /* ShowWindow() must not be used: Explorer would snap the bar to its own
@@ -588,6 +715,13 @@ static DWORD a_showStart;
    Explorer switch to "shown" at once and draw its content. */
 static void syncExplorerShown(void)
 {
+    /* Explorer takes the foreground back on this message, which closes the
+       tray's overflow window (hidden icons). Its closing changes the foreground
+       again, and that syncs the bar (TIMER_EXPLSYNC). */
+    static const WCHAR *const overflow[] = {
+        L"TopLevelWindowForOverflowXamlIsland", L"NotifyIconOverflowWindow", NULL
+    };
+    if (classIs(GetForegroundWindow(), overflow)) return;
     /* posted, not sent: Explorer can take a while to handle it, and the
        animation must not wait for that */
     PostMessageW(g_tb, WM_ACTIVATE, WA_ACTIVE, 0);
@@ -626,6 +760,17 @@ static int realReady(void)
    thumbnail of the real bar (its actual current content) on top. */
 static HANDLE  a_thumb;
 
+/* See-through bar: an overlay leaves the screen through its alpha first.
+   ShowWindow(SW_HIDE) lands a frame later than a change of alpha or of a
+   thumbnail, and for that frame the bar would be drawn twice (the Search box
+   flashes brighter). The window itself is hidden a frame later. */
+static int a_snapGoing;
+static void snapGo(void)
+{
+    ovAlpha(a_snap, 0);
+    a_snapGoing = 1;
+}
+
 static void thumbOff(void)
 {
     if (a_thumb && pDwmUnregThumb) pDwmUnregThumb(a_thumb);
@@ -648,6 +793,17 @@ static void paintCover(void)
         tp.fVisible = (LONG)(GetTickCount() - a_thumbFrom) >= 0;
         tp.fSourceClientAreaOnly = FALSE;
         pDwmUpdThumb(a_thumb, &tp);
+        /* see-through: the picture under the cover goes as the live bar
+           appears (both would draw the bar twice) */
+        if (a_tmode && tp.fVisible && IsWindowVisible(a_cover) && IsWindowVisible(a_snap)) {
+            DBG(("paintCover hides snap t=%lu\r\n", GetTickCount()));
+            if (a_snapGoing) {
+                ShowWindow(a_snap, SW_HIDE);
+                a_snapGoing = 0;
+            } else {
+                snapGo();
+            }
+        }
     }
     InvalidateRect(a_cover, NULL, FALSE);
     UpdateWindow(a_cover);
@@ -662,6 +818,7 @@ static int coverOn(void)
         return 0;
     }
     paintCover();                      /* thumbnail position before it shows */
+    SetPropW(a_cover, SEE_THRU_PROP, (HANDLE)(INT_PTR)a_tmode);   /* see a_snapSeeThru */
     showOverlay(a_cover, g_shown.left, g_shown.top, a_coverBg.w, a_coverBg.h);
     return 1;
 }
@@ -692,13 +849,183 @@ static void hideOverlay(void)
 /* Show one of our overlay windows with its new content. A window that is
    shown again first appears with what it showed last time, for one frame;
    so it is shown fully transparent, painted, and only then made opaque. */
+static int a_realUnderShown(void)
+{
+    return a_carrier == C_REAL && IsWindowVisible(g_tb);
+}
 static void showOverlay(HWND h, int x, int y, int w, int hh)
 {
-    SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+    if (h == a_snap) a_snapGoing = 0;
+    if (h == a_snapT) {
+        /* content and position in one go, so no stale frame shows */
+        POINT pt, org = { 0, 0 };
+        SIZE sz;
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        HDC sdc = GetDC(NULL);
+        pt.x = x; pt.y = y; sz.cx = w; sz.cy = hh;
+        UpdateLayeredWindow(h, sdc, &pt, &sz, a_snapS.dc, &org, 0, &bf, ULW_ALPHA);
+        ReleaseDC(NULL, sdc);
+        SetPropW(h, SEE_THRU_PROP, (HANDLE)(INT_PTR)a_snapSeeThru);
+        SetWindowPos(h, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        /* opaque picture of a real bar on screen: a bar left in a higher z-band
+           by Start / Task View would show above it, drawn twice */
+        if (!a_snapSeeThru && a_realUnderShown()) tbAlpha(TB_INVISIBLE);
+        waitFrame();
+        return;
+    }
+    ovAlpha(h, 0);
     SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
     waitFrame();
-    SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+    ovAlpha(h, 255);
+}
+
+/* See-through taskbar (a_tmode): a picture of the bar taken from the screen
+   also holds what is behind its clear background, and sliding it would drag
+   that part of the screen along. matteSnap() turns the picture a_snap shows
+   at (x, y) into one of the bar alone, with per-pixel alpha: the bar (src:
+   the real bar or the cover) is taken twice, over a black and over a white
+   backdrop put right behind it. Meanwhile the (opaque) picture stays on top,
+   excluded from these captures, so none of this is ever seen. */
+typedef BOOL (WINAPI *PFN_SetWindowDisplayAffinity)(HWND, DWORD);
+static PFN_SetWindowDisplayAffinity pSetAffinity;
+#ifndef WDA_EXCLUDEFROMCAPTURE_     /* build with 0 to record what a monitor shows during matteSnap() */
+#define WDA_EXCLUDEFROMCAPTURE_ 0x11
+#endif
+static Surface a_mB, a_mW;
+
+static void surfOpaque(Surface *s)
+{
+    int i, n = s->w * s->h;
+    if (s == &a_snapS) a_snapSeeThru = 0;
+    GdiFlush();
+    if (s->bits) for (i = 0; i < n; i++) s->bits[i] |= 0xFF000000;
+}
+
+static int zBelow(HWND top, HWND h)
+{
+    HWND w;
+    for (w = GetWindow(top, GW_HWNDNEXT); w; w = GetWindow(w, GW_HWNDNEXT))
+        if (w == h) return 1;
+    return 0;
+}
+
+/* the cover with the live thumbnail, right under the opaque picture: only
+   captures see it (the picture is excluded from them). On top of the picture
+   it would be seen, and draw the bar's see-through parts (the Search box) a
+   second time over the picture of them. */
+static int coverUnderSnap(void)
+{
+    thumbOff();
+    if (!pDwmRegThumb || FAILED(pDwmRegThumb(a_cover, g_tb, &a_thumb))) {
+        a_thumb = NULL;
+        return 0;
+    }
+    paintCover();
+    ovAlpha(a_cover, 255);
+    SetPropW(a_cover, SEE_THRU_PROP, (HANDLE)(INT_PTR)a_tmode);
+    SetWindowPos(a_cover, a_snap, g_shown.left, g_shown.top, g_shown.right - g_shown.left,
+                 g_shown.bottom - g_shown.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    RedrawWindow(a_cover, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+    waitFrame();
+    return 1;
+}
+
+static void matteSnap(int x, int y, HWND src)
+{
+    int w = a_snapS.w, h = a_snapS.h, i, n, rows, viaCover = 0;
+    if (!pSetAffinity || !a_snapS.bits || !pSetAffinity(a_snap, WDA_EXCLUDEFROMCAPTURE_)) return;
+    /* The real bar is taken through its live thumbnail on the cover: Explorer
+       may start moving the window away meanwhile, which does not move its
+       thumbnail. The bar itself is invisible for this. After Start, Task View
+       or a flyout it can stay in a z-band above all of our windows; it would
+       show above the opaque picture and end up in the captures on top of its
+       thumbnail, its see-through parts (Search) drawn twice in the picture. */
+    if (src == g_tb) {
+        tbAlpha(TB_INVISIBLE);
+        a_thumbFrom = GetTickCount();
+        if (coverUnderSnap()) { src = a_cover; viaCover = 1; }
+    }
+    a_backWhite = 0;
+    SetWindowPos(a_back, zBelow(a_snap, src) ? src : a_snap, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    RedrawWindow(a_back, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+    waitFrame();
+    capture(&a_mB, x, y);
+    a_backWhite = 1;
+    RedrawWindow(a_back, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+    waitFrame();
+    capture(&a_mW, x, y);
+    ShowWindow(a_back, SW_HIDE);
+    pSetAffinity(a_snap, 0);
+    if (viaCover) {
+        ShowWindow(a_cover, SW_HIDE);
+        thumbOff();
+    }
+    GdiFlush();
+    if (!a_mB.bits || !a_mW.bits || a_mB.w != w || a_mB.h != h) return;
+    rows = g_mon.bottom - y;                    /* rows below the screen: nothing */
+    if (rows > h) rows = h;
+    if (rows < 0) rows = 0;
+    n = w * h;
+    for (i = 0; i < n; i++) {
+        DWORD b = a_mB.bits[i], wh = a_mW.bits[i];
+        int bb = b & 255, bg = (b >> 8) & 255, br = (b >> 16) & 255;
+        int d = ((int)(wh & 255) - bb) + ((int)((wh >> 8) & 255) - bg) + ((int)((wh >> 16) & 255) - br);
+        int a = 255 - d / 3;                    /* over black: color * alpha, already premultiplied */
+        if (i >= rows * w) { a_snapS.bits[i] = 0; continue; }
+        if (a < 0) a = 0;
+        if (a > 255) a = 255;
+        if (bb > a) bb = a;
+        if (bg > a) bg = a;
+        if (br > a) br = a;
+        a_snapS.bits[i] = ((DWORD)a << 24) | ((DWORD)br << 16) | ((DWORD)bg << 8) | (DWORD)bb;
+    }
+    a_snapSeeThru = 1;
+}
+
+/* the picture made by matteSnap() replaces the (opaque) one on screen. It is
+   see-through: anything still under it shows, so the caller first takes away
+   the real bar / the cover. (A see-through element of the bar, e.g. the
+   Search box, drawn twice would look brighter for as long as both show.) */
+static void snapReveal(int x, int y)
+{
+    POINT pt, org = { 0, 0 };
+    SIZE sz;
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    HDC sdc = GetDC(NULL);
+    pt.x = x; pt.y = y; sz.cx = a_snapS.w; sz.cy = a_snapS.h;
+    UpdateLayeredWindow(a_snap, sdc, &pt, &sz, a_snapS.dc, &org, 0, &bf, ULW_ALPHA);
+    ReleaseDC(NULL, sdc);
+    SetPropW(a_snap, SEE_THRU_PROP, (HANDLE)(INT_PTR)a_snapSeeThru);
+}
+
+/* See-through bar: hand over from an overlay (picture / cover) to the real
+   bar in one frame. Both on screen would draw the bar's see-through parts
+   twice (they flash brighter); neither would make the bar blink. The bar is
+   still layered here, so its alpha changes at once; its own style comes
+   back afterwards, when nothing shows anymore. */
+static void handToReal(void)
+{
+    DBG(("handToReal start carrier=%d t=%lu\r\n", a_carrier, GetTickCount()));
+    waitFrame();                       /* right after a frame: all land in the next one */
+    tbAlpha(255);                      /* first: if timing slips, the bar is drawn twice
+                                          for a moment rather than missing for a moment */
+    if (a_thumb && pDwmUpdThumb) {
+        THUMBPROPS tp;
+        ZeroMemory(&tp, sizeof tp);
+        tp.dwFlags = TNP_VISIBLE;
+        tp.fVisible = FALSE;
+        pDwmUpdThumb(a_thumb, &tp);
+    }
+    if (IsWindowVisible(a_cover)) ovAlpha(a_cover, 0);
+    if (IsWindowVisible(a_snap)) snapGo();
+    waitFrame();
+    hideOverlay();
+    a_snapGoing = 0;
+    DBG(("handToReal swapped t=%lu\r\n", GetTickCount()));
+    waitFrame();
+    tbAlphaRestore();
+    DBG(("handToReal restored t=%lu\r\n", GetTickCount()));
 }
 
 /* real bar (fully shown) -> moving picture of it */
@@ -708,6 +1035,16 @@ static void realToSnap(void)
     posAt(a_p, &x, &y);
     capture(&a_snapS, x, y);
     a_snapValid = a_p >= 1.0;
+    if (a_tmode) {
+        surfOpaque(&a_snapS);
+        showOverlay(a_snap, x, y, a_snapS.w, a_snapS.h);
+        matteSnap(x, y, g_tb);
+        ShowWindow(g_tb, SW_HIDE);         /* under the still opaque picture */
+        snapReveal(x, y);
+        a_realUnder = 0;
+        a_carrier = C_SNAP;
+        return;
+    }
     showOverlay(a_snap, x, y, a_snapS.w, a_snapS.h);
     waitFrame();                       /* picture is on screen before the real one goes */
     ShowWindow(g_tb, SW_HIDE);
@@ -723,7 +1060,29 @@ static void realToSnapHold(void)
 {
     capture(&a_snapS, g_shown.left, g_shown.top);
     a_snapValid = 1;
+    if (a_tmode) surfOpaque(&a_snapS);
     showOverlay(a_snap, g_shown.left, g_shown.top, a_snapS.w, a_snapS.h);
+    if (a_tmode) {
+        /* the picture is see-through: the real bar under it must not show
+           (it would be drawn twice, and Explorer may start sliding it away,
+           which would show as a second taskbar). It is taken away while
+           the opaque picture still covers it. */
+        matteSnap(g_shown.left, g_shown.top, g_tb);
+        if (g_wantLayer) {
+            /* flyout open: already invisible (matteSnap). Explorer will hide
+               the bar by itself; guard() needs it there to see that. */
+            snapReveal(g_shown.left, g_shown.top);
+        } else {
+            /* Explorer starts sliding the bar away by itself and drops a
+               layered style we give it then, so alpha cannot hide it: it
+               goes. Coming back re-shows it under the picture (the
+               a_realUnder = 0 case below), the picture covering the few
+               frames Explorer needs to redraw it. */
+            ShowWindow(g_tb, SW_HIDE);
+            a_realUnder = 0;
+            snapReveal(g_shown.left, g_shown.top);
+        }
+    }
     /* With a flyout open (Quick Settings / calendar) the real bar may sit
        above our picture (higher z-band), and Explorer may start its own
        30 fps hide: make it invisible so none of that shows. It is already
@@ -782,6 +1141,7 @@ static void startShow(void)
    live while Explorer finishes showing the real bar */
 static void snapToCover(void)
 {
+    DBG(("snapToCover real=%d thumbIn=%ld t=%lu\r\n", a_realUnder, (LONG)(a_thumbFrom - GetTickCount()), GetTickCount()));
     capture(&a_coverBg, g_shown.left, g_shown.top);   /* = the picture, fully shown */
     a_carrier = C_COMP;
     /* the picture stays under the cover and goes away with it (hideOverlay),
@@ -794,15 +1154,8 @@ static void copySurface(Surface *dst, Surface *src)
 {
     HDC sdc;
     if (!src->bmp) return;
-    if (dst->w != src->w || dst->h != src->h || !dst->bmp) {
-        sdc = GetDC(NULL);
-        if (dst->bmp) { SelectObject(dst->dc, dst->old); DeleteObject(dst->bmp); }
-        if (!dst->dc) dst->dc = CreateCompatibleDC(sdc);
-        dst->bmp = CreateCompatibleBitmap(sdc, src->w, src->h);
-        dst->old = SelectObject(dst->dc, dst->bmp);
-        dst->w = src->w; dst->h = src->h;
-        ReleaseDC(NULL, sdc);
-    }
+    (void)sdc;
+    if (dst->w != src->w || dst->h != src->h || !dst->bmp) surfAlloc(dst, src->w, src->h);
     BitBlt(dst->dc, 0, 0, src->w, src->h, src->dc, 0, 0, SRCCOPY);
 }
 
@@ -831,8 +1184,12 @@ static void snapToCoverPartial(void)
     }
     a_carrier = C_COMP;
     if (coverOn()) {
-        waitFrame();
-        ShowWindow(a_snap, SW_HIDE);
+        if (a_tmode) {
+            snapGo();                  /* never both: see snapGo() */
+        } else {
+            waitFrame();
+            ShowWindow(a_snap, SW_HIDE);
+        }
     } else {
         a_carrier = C_SNAP;
     }
@@ -842,6 +1199,7 @@ static void snapToCoverPartial(void)
    its hidden spot): hide that under the cover until it is back */
 static void maskNativeUnhide(void)
 {
+    /* invisible first: Explorer's own slide must not show (tests: qs-rapid) */
     tbAlpha(TB_INVISIBLE);
     a_thumbFrom = GetTickCount();
     capture(&a_coverBg, g_shown.left, g_shown.top);
@@ -860,12 +1218,21 @@ static void compToSnap(void)
     posAt(a_p, &x, &y);
     capture(&a_snapS, x, y);           /* the cover (live bar) is what is on screen */
     a_snapValid = a_p >= 1.0;
+    if (a_tmode) surfOpaque(&a_snapS);
     showOverlay(a_snap, x, y, a_snapS.w, a_snapS.h);
+    if (a_tmode) matteSnap(x, y, a_cover);
     ShowWindow(a_cover, SW_HIDE);
     thumbOff();
     realUnder(0);
+    if (a_tmode) snapReveal(x, y);
     a_carrier = C_SNAP;
 }
+
+/* a window went full screen over the shown bar: no slide, a picture taken from
+   the screen would show (and drag along) that window */
+static volatile LONG g_hideNow;
+/* new geometry while the bar is up: put the real bar at its new spot (guard) */
+static volatile LONG g_replace;
 
 static void animate(void)
 {
@@ -878,8 +1245,21 @@ static void animate(void)
         double target, dt;
         if (g_paused) return;
 
+        if (a_carrier == C_NONE || a_carrier == C_REAL) {
+            a_tmode = cfgTransparent;           /* see a_tmode */
+            a_snap = a_tmode ? a_snapT : a_snapO;
+        }
         if (d == D_HIDDEN) {
             target = 0.0;
+            if (InterlockedExchange(&g_hideNow, 0) && a_carrier != C_NONE) {
+                hideOverlay();
+                a_snapGoing = 0;
+                ShowWindow(g_tb, SW_HIDE);
+                tbAlphaRestore();
+                a_realUnder = 0;
+                a_p = 0.0;
+                a_carrier = C_NONE;
+            }
             if (a_carrier == C_REAL) realToSnap();
             else if (a_carrier == C_COMP) compToSnap();
             else realUnder(0);
@@ -908,9 +1288,14 @@ static void animate(void)
             } else if (a_carrier == C_SNAP && a_p >= 1.0) {
                 if (a_realUnder && realAtFull() && contentShown()) {
                     /* came back while the real bar is still in place: drop the picture */
-                    tbAlphaRestore();
-                    waitFrame();               /* real bar opaque before the picture goes */
-                    ShowWindow(a_snap, SW_HIDE);
+                    barRaise();
+                    if (a_tmode) {
+                        handToReal();
+                    } else {
+                        tbAlphaRestore();
+                        waitFrame();               /* real bar opaque before the picture goes */
+                        ShowWindow(a_snap, SW_HIDE);
+                    }
                     a_carrier = C_REAL;
                 } else {
                     /* the real bar has to be (re)shown: keep the picture until
@@ -937,9 +1322,14 @@ static void animate(void)
                 if (realReady()) {
                     /* real bar is ready: opaque again, and its original window
                        style back (a taskbar left layered reacts more slowly) */
-                    tbAlphaRestore();
-                    waitFrame();
-                    hideOverlay();
+                    barRaise();
+                    if (a_tmode) {
+                        handToReal();
+                    } else {
+                        tbAlphaRestore();
+                        waitFrame();
+                        hideOverlay();
+                    }
                     a_carrier = C_REAL;
                 } else {
                     if (a_carrier == C_COMP) paintCover();
@@ -987,7 +1377,25 @@ static volatile LONG g_precapReq;
 
 static void precapture(void)
 {
-    if (a_carrier == C_REAL && a_p >= 1.0 && realAtFull() && contentShown()) {
+    if (a_carrier == C_REAL && a_p >= 1.0 && realAtFull() && contentShown() && a_tmode) {
+        /* see-through bar: a picture of the bar alone (matteSnap), taken
+           under a still picture that stands over the bar for a few frames */
+        capture(&a_snapS, g_shown.left, g_shown.top);
+        surfOpaque(&a_snapS);
+        showOverlay(a_snap, g_shown.left, g_shown.top, a_snapS.w, a_snapS.h);
+        /* The bar is invisible meanwhile (the opaque picture looks the same),
+           and comes back in the frame the picture goes - unless Explorer
+           moved it: guard() takes over then */
+        matteSnap(g_shown.left, g_shown.top, g_tb);
+        if (realAtFull()) {
+            waitFrame();
+            tbAlpha(255);
+        }
+        ShowWindow(a_snap, SW_HIDE);
+        copySurface(&a_precap, &a_snapS);
+        a_precapAt = GetTickCount();
+        a_precapOk = 1;
+    } else if (a_carrier == C_REAL && a_p >= 1.0 && realAtFull() && contentShown()) {
         capture(&a_precap, g_shown.left, g_shown.top);
         a_precapAt = GetTickCount();
         a_precapOk = 1;
@@ -1028,7 +1436,14 @@ static void guard(void)
         }
     } else if (a_carrier == C_REAL && a_p >= 1.0 && g_desired == D_SHOWN) {
         RECT r;
-        if (g_wantLayer) tbPrelayer();
+        if (InterlockedExchange(&g_replace, 0) && IsWindowVisible(g_tb)) {
+            placeReal(1.0);
+            showContent();
+        }
+        if (realAtFull()) barRaise();
+        /* (see-through: a bar Explorer is moving away stays invisible, see
+           precapture(); it is dealt with below) */
+        if (g_wantLayer) { if (!a_tmode || realAtFull()) tbPrelayer(); }
         else tbAlphaRestore();
         if (!IsWindowVisible(g_tb)) showRealFull();
         else if (GetWindowRect(g_tb, &r) && (r.left != g_shown.left || r.top != g_shown.top)) {
@@ -1039,7 +1454,16 @@ static void guard(void)
                  a_precapOk, GetTickCount() - a_precapAt, GetTickCount()));
             POINT pt;
             GetCursorPos(&pt);
-            if (along * 4 >= full * 3 || (along > 0 && cursorOnBar(pt))) {
+            if (along > 0 && g_wantLayer && cursorOnBar(pt) && fullscreenBehind()) {
+                /* A tray flyout opened from Start over a window Windows takes
+                   for full screen (Riot Client): Explorer pulls the bar to its
+                   hidden spot under the cursor, past the pin, and does not
+                   bring it back. Put it back at once: covering it would show
+                   the drop, and then a picture where the live bar should be. */
+                DBG(("guard: bar pulled away with a flyout open, put back t=%lu\r\n", GetTickCount()));
+                placeReal(1.0);
+                showContent();
+            } else if (along * 4 >= full * 3 || (along > 0 && cursorOnBar(pt))) {
                 /* jumped (almost) all the way: Explorer restarts its own unhide.
                    Or Explorer started its own hide just as the cursor came back
                    onto the bar: it brings the bar back by itself. Either way,
@@ -1055,6 +1479,7 @@ static void guard(void)
                    bar invisible, and hide it the normal FastBar way */
                 a_precapOk = 0;
                 copySurface(&a_snapS, &a_precap);
+                a_snapSeeThru = a_tmode;       /* precapture() made it with matteSnap() */
                 a_snapValid = 1;
                 showOverlay(a_snap, g_shown.left, g_shown.top, a_snapS.w, a_snapS.h);
                 tbAlpha(TB_INVISIBLE);
@@ -1087,7 +1512,14 @@ static LRESULT CALLBACK SnapProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
-        if (h == a_cover) {
+        if (h == a_back) {
+            FillRect(dc, &ps.rcPaint, (HBRUSH)GetStockObject(a_backWhite ? WHITE_BRUSH : BLACK_BRUSH));
+        } else if (h == a_cover && a_tmode) {
+            /* see-through: the color key leaves only the live thumbnail */
+            HBRUSH b = CreateSolidBrush(COVER_KEY);
+            FillRect(dc, &ps.rcPaint, b);
+            DeleteObject(b);
+        } else if (h == a_cover) {
             /* background; the live thumbnail of the bar is drawn on top by DWM */
             if (a_coverBg.dc) BitBlt(dc, 0, 0, a_coverBg.w, a_coverBg.h, a_coverBg.dc, 0, 0, SRCCOPY);
         } else if (a_snapS.dc) {
@@ -1114,15 +1546,27 @@ static DWORD WINAPI AnimThread(LPVOID unused)
     RegisterClassW(&wc);
     /* both overlays are click-through (layered + transparent): the mouse goes
        to the real bar underneath, which is what makes Explorer draw it */
-    a_snap = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+    pSetAffinity = (PFN_SetWindowDisplayAffinity)GetProcAddress(GetModuleHandleW(L"user32.dll"),
+                                                                "SetWindowDisplayAffinity");
+    a_snapT = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+                              WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                              wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
+                              NULL, NULL, wc.hInstance, NULL);
+    a_back = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
                              WS_EX_LAYERED | WS_EX_TRANSPARENT,
                              wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
                              NULL, NULL, wc.hInstance, NULL);
+    SetLayeredWindowAttributes(a_back, 0, 255, LWA_ALPHA);
+    a_snapO = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+                              WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                              wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
+                              NULL, NULL, wc.hInstance, NULL);
+    SetLayeredWindowAttributes(a_snapO, 0, 255, LWA_ALPHA);
+    a_snap = a_snapO;
     a_cover = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
                               WS_EX_LAYERED | WS_EX_TRANSPARENT,
                               wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
                               NULL, NULL, wc.hInstance, NULL);
-    SetLayeredWindowAttributes(a_snap, 0, 255, LWA_ALPHA);
     SetLayeredWindowAttributes(a_cover, 0, 255, LWA_ALPHA);
     for (;;) {
         DWORD r = MsgWaitForMultipleObjects(1, &g_evt, FALSE, INFINITE, QS_ALLINPUT);
@@ -1152,7 +1596,8 @@ static void restoreTaskbar(void)
     InterlockedExchange(&g_paused, 1);
     SetEvent(g_evt);
     for (i = 0; i < 100 && !g_animIdle; i++) Sleep(5);
-    if (a_snap) ShowWindow(a_snap, SW_HIDE);
+    if (a_snapO) ShowWindow(a_snapO, SW_HIDE);
+    if (a_snapT) ShowWindow(a_snapT, SW_HIDE);
     if (a_cover) ShowWindow(a_cover, SW_HIDE);
     thumbOff();
     if (g_tb) {
@@ -1206,12 +1651,77 @@ static DWORD g_leaveAt;     /* when the cursor last left the bar */
 /* the cursor is away but an open flyout (Quick Settings, calendar, jump list...)
    keeps the bar up: it is frozen into a picture (D_HOLD) while in M_SHOWN */
 static int g_frozen;
+/* Win+T / Win+B: the keyboard focus went to the hidden bar (the foreground
+   switched to it while it was hidden). Explorer would unhide it; FastBar shows
+   it and keeps it live and up for as long as the focus stays there. */
+static int g_kbFocus;
+static const WCHAR *const kTrayClasses[] = { L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", NULL };
 
 /* should the bar stay up / come back? */
+/* A menu opened from the bar is still open: the bar's own (right-click on the
+   bar or on Start) or a tray icon's. The foreground stays on the bar for these,
+   so fgKeeps() does not see them. Only menus next to the bar count.
+   The bar's own menu is a XAML popup that opens where the bar was right-clicked
+   (mouse hook). Its tooltips are XAML popups with the same styles (one stays up
+   while a bar button has the keyboard focus), so only that popup counts. */
+static int   g_rclickArm;
+static POINT g_rclickPt;
+static DWORD g_rclickAt;
+static HWND  g_menuWnd;
+static HWND  g_preMenu[8];               /* XAML popups already up at the click */
+static int   g_preMenuN;
+
+static void armBarMenu(POINT pt)
+{
+    HWND h = NULL;
+    g_rclickArm = 1;
+    g_rclickPt = pt;
+    g_rclickAt = GetTickCount();
+    g_menuWnd = NULL;
+    /* a tooltip (the clicked button's, shown on hover) is up before the click */
+    g_preMenuN = 0;
+    while ((h = FindWindowExW(NULL, h, L"Xaml_WindowedPopupClass", NULL)) != NULL && g_preMenuN < 8)
+        if (IsWindowVisible(h)) g_preMenu[g_preMenuN++] = h;
+}
+
+static int barMenuOpen(void)
+{
+    RECT nearBar = g_shown, r, x;
+    HWND h = NULL;
+    InflateRect(&nearBar, 24, 24);
+    /* a tray icon's menu (its own program's): this class is always a menu */
+    while ((h = FindWindowExW(NULL, h, L"#32768", NULL)) != NULL)
+        if (IsWindowVisible(h) && !isCloaked(h) && GetWindowRect(h, &r) &&
+            r.right - r.left > 20 && r.bottom - r.top > 8 && IntersectRect(&x, &r, &nearBar)) {
+            g_rclickArm = 0;               /* the right-click was on a tray icon */
+            g_menuWnd = NULL;
+            return 1;
+        }
+    if (g_menuWnd) {
+        if (IsWindow(g_menuWnd) && IsWindowVisible(g_menuWnd) && !isCloaked(g_menuWnd)) return 1;
+        g_menuWnd = NULL;                  /* closed */
+        g_rclickArm = 0;
+        return 0;
+    }
+    if (!g_rclickArm) return 0;
+    if (GetTickCount() - g_rclickAt > 1500) { g_rclickArm = 0; return 0; }   /* no menu came */
+    h = NULL;
+    while ((h = FindWindowExW(NULL, h, L"Xaml_WindowedPopupClass", NULL)) != NULL) {
+        int i, old = 0;
+        for (i = 0; i < g_preMenuN; i++) old |= g_preMenu[i] == h;
+        if (!old && IsWindowVisible(h) && !isCloaked(h) && GetWindowRect(h, &r) &&
+            r.left - 8 <= g_rclickPt.x && g_rclickPt.x <= r.right + 8 && IntersectRect(&x, &r, &nearBar)) {
+            g_menuWnd = h;
+            return 1;
+        }
+    }
+    return 1;                              /* still opening */
+}
+
 static int wantShown(POINT pt, HWND fg)
 {
     if (g_explHid) return cursorOnBar(pt);
-    return cursorInside(pt) || fgKeeps(fg);
+    return cursorInside(pt) || fgKeeps(fg) || g_kbFocus || barMenuOpen();
 }
 
 static void killShow(void) { KillTimer(g_hwnd, TIMER_SHOW); g_showPending = 0; }
@@ -1289,13 +1799,17 @@ static void evaluate(void)
     else GetCursorPos(&pt);
     fg = GetForegroundWindow();
     updatePolling(fg);
+    /* the cursor is on the shown bar: Explorer must not hide it (tap.c) */
+    if (g_kbFocus && !classIs(fg, kTrayClasses)) g_kbFocus = 0;   /* focus went elsewhere */
+    tapPin(g_mode == M_SHOWN && (cursorOnBar(pt) || g_kbFocus));
     DBG(("eval pt=%ld,%ld mode=%d mon=%ld,%ld,%ld,%ld edge=%d at=%d full=%d t=%lu\r\n", pt.x, pt.y, g_mode,
          g_mon.left, g_mon.top, g_mon.right, g_mon.bottom, g_edge, atEdge(pt), fgIsFullscreen(),
          GetTickCount()));
 
     if (g_mode == M_HIDDEN) {
         if (cfgShowOnStart && isStartOrSearch(fg)) { showNow(); return; }
-        if (atEdge(pt) && !(cfgBlockFull && fgIsFullscreen())) {
+        if (g_kbFocus && !blockedFull()) { showNow(); return; }
+        if (atEdge(pt) && !blockedFull()) {
             if (cfgShowDelay <= 0) showNow();
             else if (g_showPending && (LONG)(GetTickCount() - g_showSince) >= cfgShowDelay)
                 showNow();          /* delay over (the timer may also be late) */
@@ -1313,11 +1827,25 @@ static void evaluate(void)
                 SetTimer(g_hwnd, TIMER_SHOW, cfgShowDelay, NULL);
                 DBG(("show delay starts pt=%ld,%ld t=%lu\r\n", pt.x, pt.y, GetTickCount()));
             }
-        } else if (!(g_showPending && inBarArea(pt) && !(cfgBlockFull && fgIsFullscreen()))) {
+        } else if (!(g_showPending && inBarArea(pt) && !blockedFull())) {
             killShow();             /* left the bar's area: start over next time */
         } else if ((LONG)(GetTickCount() - g_showSince) >= cfgShowDelay && nearEdge(pt)) {
             showNow();              /* delay over, cursor back near the edge */
         }
+        return;
+    }
+
+    if (blockedFull()) {
+        /* went full screen while the bar was up (F11 / YouTube's "f" with the
+           cursor on the bar, or back from Start): the bar is covered now */
+        KillTimer(g_hwnd, TIMER_HIDE);
+        g_mode = M_HIDDEN;
+        g_explHid = 0;
+        g_frozen = 0;
+        g_onBar = 0;
+        InterlockedExchange(&g_hideNow, 1);
+        tapPin(0);
+        setDesired(D_HIDDEN);
         return;
     }
 
@@ -1333,10 +1861,15 @@ static void evaluate(void)
         /* cursor just left the bar: keep a picture of it, in case Explorer
            starts hiding it by itself (see guard) */
         int on = cursorOnBar(pt);
+        if (g_desired == D_SHOWN && barCovered()) SetEvent(g_evt);   /* guard raises it */
         if (!on && g_onBar) {
             g_leaveAt = GetTickCount();
-            InterlockedExchange(&g_precapReq, 1);
-            SetEvent(g_evt);
+            /* (see-through: the picture takes a few frames; without a flyout
+               the bar goes to D_HOLD right below, which takes its own) */
+            if (!cfgTransparent || fgKeeps(fg)) {
+                InterlockedExchange(&g_precapReq, 1);
+                SetEvent(g_evt);
+            }
         }
         g_onBar = on;
     }
@@ -1359,7 +1892,7 @@ static void evaluate(void)
         } else {
             /* kept up only by an open flyout, cursor elsewhere: freeze the
                bar into a picture; live again once the cursor is back */
-            int frz = !cursorInside(pt);
+            int frz = !cursorInside(pt) && !g_kbFocus;   /* (keyboard: stays live) */
             if (frz != g_frozen) {
                 g_frozen = frz;
                 setDesired(frz ? D_HOLD : D_SHOWN);
@@ -1400,6 +1933,13 @@ static LRESULT CALLBACK MouseProc(int code, WPARAM wp, LPARAM lp)
         g_hookFresh = 1;
         if (wp == WM_LBUTTONDOWN)
             g_dragInside = (g_mode != M_HIDDEN) && PtInRect(&g_shown, pt);
+        if (wp == WM_RBUTTONUP && g_mode != M_HIDDEN && PtInRect(&g_shown, pt)) {
+            armBarMenu(pt);                /* see barMenuOpen */
+            /* no menu came (barMenuOpen gives up after 1.5 s): look again then,
+               even if the cursor rests away from the bar */
+            g_reevalLeft = 1;
+            SetTimer(g_hwnd, TIMER_REEVAL, 1600, NULL);
+        }
         /* while hidden only the screen edge matters: skip everything else */
         relevant = (g_mode != M_HIDDEN) || atEdge(pt) || cfgShowDelay > 0;
         if (relevant && !InterlockedExchange(&g_evalPosted, 1))
@@ -1412,13 +1952,39 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hk, DWORD ev, HWND h, LONG obj, 
                                   DWORD thread, DWORD time)
 {
     (void)hk; (void)child; (void)thread; (void)time;
+    if (ev == EVENT_SYSTEM_MENUPOPUPEND || (ev == EVENT_OBJECT_HIDE && obj == OBJID_WINDOW && h != g_tb)) {
+        /* a menu (or another popup of Explorer) closed: may the bar go now?
+           (see barMenuOpen; the cursor may be resting away from the bar) */
+        if (g_mode != M_HIDDEN) PostMessageW(g_hwnd, WM_APP_EVAL, 0, 0);
+        return;
+    }
     if (ev == EVENT_SYSTEM_FOREGROUND) {
+        /* Win+T / Win+B come from a program's window. A flyout or Start that
+           closes hands the foreground back to the bar too (Esc on the
+           calendar with the bar hidden): that is no keyboard focus. */
+        static HWND lastFg;
+        static const WCHAR *const passing[] = { L"ForegroundStaging", NULL };
+        if (g_mode == M_HIDDEN && classIs(h, kTrayClasses) && lastFg &&
+            !classIs(lastFg, kFgKeepClasses) && !classIs(lastFg, kTrayClasses) &&
+            !classIs(lastFg, kPopupClasses))
+            g_kbFocus = 1;
+        if (h && !classIs(h, passing)) lastFg = h;
+        /* Explorer tried to hide the pinned bar and now believes it is hidden;
+           the first click would restart its own unhide. Told it is shown once
+           that is over, as a FastBar show does. */
+        if (g_mode == M_SHOWN) SetTimer(g_hwnd, TIMER_EXPLSYNC, 700, NULL);
         PostMessageW(g_hwnd, WM_APP_EVAL, 0, 0);
         /* Start/search close with an animation; look again once it is gone */
         g_reevalLeft = 3;
         SetTimer(g_hwnd, TIMER_REEVAL, 150, NULL);
-    } else if (h == g_tb && obj == OBJID_WINDOW && !g_paused && g_animIdle) {
-        SetEvent(g_evt);   /* let the anim thread re-check (guard) */
+    } else if (h == g_tb && obj == OBJID_WINDOW && !g_paused) {
+        /* Explorer gave the bar a new size (resolution or scaling changed):
+           FastBar's geometry was read before that, see geometryChanged() */
+        RECT r;
+        if (GetWindowRect(g_tb, &r) && (r.right - r.left != g_shown.right - g_shown.left ||
+                                        r.bottom - r.top != g_shown.bottom - g_shown.top))
+            PostMessageW(g_hwnd, WM_APP_GEOM, 0, 0);
+        if (g_animIdle) SetEvent(g_evt);   /* let the anim thread re-check (guard) */
     }
 }
 
@@ -1434,7 +2000,7 @@ static void hookShell(void)
     unhookShell();
     if (!g_tb) return;
     GetWindowThreadProcessId(g_tb, &pid);
-    g_showHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, NULL, WinEventProc,
+    g_showHook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, NULL, WinEventProc,
                                  pid, 0, WINEVENT_OUTOFCONTEXT);
     g_locHook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, NULL,
                                 WinEventProc, pid, 0, WINEVENT_OUTOFCONTEXT);
@@ -1485,6 +2051,84 @@ static void engage(void)
         updateGeometry();
     }
     mouseHook(1);
+}
+
+/* ---------- see-through taskbar background ----------
+   FastBarTap.dll (64-bit) is loaded into Explorer by 64-bit rundll32 and
+   makes the taskbar's XAML background clear (see tap.c). Once it is there,
+   it is switched with messages to its windows. */
+#define TAP_CLASS   L"FastBarTapWnd"
+#define TAP_MSG_SET (WM_APP + 1)
+static HANDLE g_tapProc;            /* rundll32 loading the DLL */
+
+#define TAP_MSG_PIN (WM_APP + 2)
+static int g_tapPinned = -1;         /* what the DLL was told last; -1: not told yet */
+static void tapPin(int on)
+{
+    HWND w;
+    int n = 0;
+    if (on == g_tapPinned) return;
+    for (w = FindWindowExW(HWND_MESSAGE, NULL, TAP_CLASS, NULL); w;
+         w = FindWindowExW(HWND_MESSAGE, w, TAP_CLASS, NULL), n++)
+        PostMessageW(w, TAP_MSG_PIN, on, 0);
+    DBG(("tapPin %d windows=%d t=%lu\r\n", on, n, GetTickCount()));
+    if (n) g_tapPinned = on;         /* DLL not there (yet): try again next time */
+}
+
+static int tapSend(int on)
+{
+    HWND w;
+    int n = 0;
+    for (w = FindWindowExW(HWND_MESSAGE, NULL, TAP_CLASS, NULL); w;
+         w = FindWindowExW(HWND_MESSAGE, w, TAP_CLASS, NULL), n++)
+        PostMessageW(w, TAP_MSG_SET, on, (LPARAM)(LONG)cfgColor);
+    return n;
+}
+
+static void tapApply(void)
+{
+    WCHAR dll[MAX_PATH], line[2 * MAX_PATH + 64], *slash, *p;
+    STARTUPINFOW si = { sizeof si };
+    PROCESS_INFORMATION pi;
+    BOOL wow = FALSE;
+    typedef BOOL (WINAPI *PFN_IsWow64)(HANDLE, PBOOL);
+    PFN_IsWow64 isWow;
+    UINT n;
+    /* loaded in any case: the pin is needed with a solid taskbar too */
+    if (tapSend(cfgTransparent)) return;     /* already in Explorer */
+    if (g_tapProc) {
+        if (WaitForSingleObject(g_tapProc, 0) == WAIT_TIMEOUT) return;   /* still loading */
+        CloseHandle(g_tapProc);
+        g_tapProc = NULL;
+    }
+    if (!FindWindowW(L"Shell_TrayWnd", NULL)) return;
+    lstrcpyW(dll, g_exePath);
+    for (slash = p = dll; *p; p++) if (*p == L'\\') slash = p + 1;
+    lstrcpyW(slash, L"FastBarTap.dll");
+    if (GetFileAttributesW(dll) == INVALID_FILE_ATTRIBUTES) return;
+    isWow = (PFN_IsWow64)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process");
+    if (isWow) isWow(GetCurrentProcess(), &wow);
+    /* the DLL is 64-bit: from a 32-bit FastBar, System32 is redirected */
+    n = GetWindowsDirectoryW(line + 1, MAX_PATH);
+    line[0] = L'"';
+    {
+        WCHAR arg[16];
+        if (cfgTransparent) wsprintfW(arg, L"%08lX", cfgColor);
+        else lstrcpyW(arg, L"off");
+        wsprintfW(line + 1 + n, L"%s\" \"%s\",Inject %s",
+                  wow ? L"\\Sysnative\\rundll32.exe" : L"\\System32\\rundll32.exe", dll, arg);
+    }
+    if (CreateProcessW(NULL, line, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        g_tapProc = pi.hProcess;
+    }
+}
+
+static void setTransparent(int on)
+{
+    InterlockedExchange(&cfgTransparent, on);
+    iniSetInt(L"TransparentTaskbar", on);
+    tapApply();
 }
 
 static void setEnabled(int on)
@@ -1575,6 +2219,7 @@ static void showMenu(void)
     HMENU m = CreatePopupMenu();
     int cmd;
     AppendMenuW(m, MF_STRING | (g_enabled ? MF_CHECKED : 0), ID_ENABLE, L"Enabled");
+    AppendMenuW(m, MF_STRING | (cfgTransparent ? MF_CHECKED : 0), ID_TRANSPARENT, L"Transparent taskbar");
     AppendMenuW(m, MF_STRING | (startupEnabled() ? MF_CHECKED : 0), ID_STARTUP, L"Start with Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, ID_SETTINGS, L"Edit settings...");
@@ -1589,8 +2234,24 @@ static void showMenu(void)
     case ID_ENABLE:   setEnabled(!g_enabled); break;
     case ID_STARTUP:  setStartup(!startupEnabled()); break;
     case ID_SETTINGS: ShellExecuteW(NULL, L"open", L"notepad.exe", g_iniPath, NULL, SW_SHOWNORMAL); break;
-    case ID_RELOAD:   loadSettings(); break;
+    case ID_TRANSPARENT: setTransparent(!cfgTransparent); break;
+    case ID_RELOAD:   loadSettings(); tapApply(); break;
     case ID_EXIT:     DestroyWindow(g_hwnd); break;
+    }
+}
+
+/* The bar's size or the screen changed: new geometry, and a bar that is up is
+   put where it now belongs (the anim thread does it, see g_replace) */
+static int g_geomLeft;
+static void geometryChanged(void)
+{
+    RECT old = g_shown, oldMon = g_mon;
+    updateGeometry();
+    if (EqualRect(&old, &g_shown) && EqualRect(&oldMon, &g_mon)) return;
+    DBG(("geometry changed, mode=%d t=%lu\r\n", g_mode, GetTickCount()));
+    if (g_mode != M_HIDDEN) {
+        InterlockedExchange(&g_replace, 1);
+        setDesired(g_desired);
     }
 }
 
@@ -1643,6 +2304,21 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         KillTimer(h, w);
+        if (w == TIMER_TAP) {
+            tapApply();
+            return 0;
+        }
+        if (w == TIMER_GEOM) {
+            if (g_enabled && g_tb) geometryChanged();
+            if (--g_geomLeft > 0) SetTimer(h, TIMER_GEOM, 300, NULL);
+            return 0;
+        }
+        if (w == TIMER_EXPLSYNC) {
+            POINT pt;
+            GetCursorPos(&pt);
+            if (g_mode == M_SHOWN && cursorOnBar(pt)) syncExplorerShown();
+            return 0;
+        }
         if (w == TIMER_EXPLHID) {
             if (g_mode == M_HIDDEN) SetEvent(g_evt);   /* guard hides the window */
             return 0;
@@ -1660,7 +2336,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
                g_showPending stays set and evaluate() shows the bar as soon as
                the cursor touches the edge again (or forgets it once the cursor
                leaves the bar's area) */
-            if (g_mode == M_HIDDEN && nearEdge(pt)) showNow();
+            if (g_mode == M_HIDDEN && nearEdge(pt) && !blockedFull()) showNow();
             else if (g_mode != M_HIDDEN) g_showPending = 0;
         } else if (w == TIMER_HIDE && g_mode == M_LEAVING) {
             POINT pt;
@@ -1683,13 +2359,20 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_SETTINGCHANGE:
         autoHideChangedByUser();
+        if (cfgTransparent && !g_settingAutoHide) SetTimer(h, TIMER_TAP, 800, NULL);
         /* fall through */
     case WM_DISPLAYCHANGE:
     case WM_DPICHANGED:
         if (g_enabled && g_tb) {
-            updateGeometry();
-            if (g_mode != M_HIDDEN) setDesired(g_desired); /* re-place */
+            geometryChanged();
+            /* Explorer resizes the bar for the new resolution / scaling only
+               after this message: look again a few times */
+            g_geomLeft = 6;
+            SetTimer(h, TIMER_GEOM, 300, NULL);
         }
+        return 0;
+    case WM_APP_GEOM:
+        if (g_enabled && g_tb) geometryChanged();
         return 0;
     case WM_QUERYENDSESSION:
         return TRUE;
@@ -1698,12 +2381,16 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_DESTROY:
         if (g_enabled) restoreTaskbar();
+        tapPin(0);
+        tapSend(0);                         /* the taskbar's own background back */
         trayRemove();
         PostQuitMessage(0);
         return 0;
     }
     if (m == g_msgTaskbarCreated && m) {   /* Explorer restarted */
         trayAdd();
+        g_tapPinned = -1;
+        SetTimer(h, TIMER_TAP, 2000, NULL);    /* once its XAML is up */
         if (g_enabled) {
             mouseHook(0);
             InterlockedExchange(&g_paused, 1);
@@ -1726,6 +2413,8 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *e)
         setAutoHide(g_origAutoHide);
         iniSetInt(L"Running", 0);
     }
+    tapPin(0);
+    tapSend(0);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -1788,6 +2477,9 @@ static void runWatchdog(DWORD pid)
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);   /* tiny while waiting */
     WaitForSingleObject(p, INFINITE);
     CloseHandle(p);
+    g_tapPinned = 1;                           /* (this process never told it) */
+    tapPin(0);
+    tapSend(0);                                /* see-through background off */
     if (!iniInt(L"Running", 0)) return;        /* FastBar cleaned up itself */
     g_tb = FindWindowW(L"Shell_TrayWnd", NULL);
     if (g_tb) {
@@ -1937,8 +2629,12 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
 
     engage();
     startGuard();
+    tapApply();
     g_fgHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, WinEventProc,
                                0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    /* tray icons' menus belong to their own programs: their closing comes from here */
+    g_menuHook = SetWinEventHook(EVENT_SYSTEM_MENUPOPUPEND, EVENT_SYSTEM_MENUPOPUPEND, NULL, WinEventProc,
+                                 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     /* drop startup pages: keeps the resident footprint tiny */
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
@@ -1950,6 +2646,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
 
     UnhookWindowsHookEx(g_mouseHook);
     UnhookWinEvent(g_fgHook);
+    if (g_menuHook) UnhookWinEvent(g_menuHook);
     unhookShell();
     ReleaseMutex(mtx);
     return 0;

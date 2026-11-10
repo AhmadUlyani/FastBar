@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>FastBar test: moving picture</title>
+<!-- stands in for a YouTube video: a click makes the page full screen -->
+<style>html,body{margin:0;height:100%;background:#000}canvas{width:100%;height:100%;display:block}</style>
+<canvas id="c"></canvas>
+<script>
+const c = document.getElementById('c'), g = c.getContext('2d');
+let t = 0;
+function draw() {
+  c.width = innerWidth; c.height = innerHeight; t += 2;
+  for (let i = 0; i < 12; i++) {
+    g.fillStyle = `hsl(${(t + i * 30) % 360} 90% 50%)`;
+    g.fillRect(i * c.width / 12, 0, c.width / 12, c.height);
+  }
+  g.fillStyle = '#fff'; g.fillRect(t * 3 % c.width, 0, 60, c.height);
+  requestAnimationFrame(draw);
+}
+draw();
+document.addEventListener('click', () => document.documentElement.requestFullscreen());
+</script>

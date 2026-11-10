@@ -45,6 +45,19 @@ static DWORD parseNum(const WCHAR *s)
     return v;
 }
 
+/* FastBarTap.dll (see-through taskbar background) in Explorer: original
+   background back. Posted, so it does not matter that FastBar is gone. */
+static void tapOff(void)
+{
+    HWND w;
+    for (w = FindWindowExW(HWND_MESSAGE, NULL, L"FastBarTapWnd", NULL); w;
+         w = FindWindowExW(HWND_MESSAGE, w, L"FastBarTapWnd", NULL))
+    {
+        PostMessageW(w, WM_APP + 1, 0, 0);     /* original background */
+        PostMessageW(w, WM_APP + 2, 0, 0);     /* the bar is not pinned anymore */
+    }
+}
+
 static void restoreTaskbar(void)
 {
     HWND tb = FindWindowW(L"Shell_TrayWnd", NULL);
@@ -93,6 +106,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
         SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);   /* tiny while waiting */
         WaitForSingleObject(proc, INFINITE);
         CloseHandle(proc);
+        tapOff();
         if (GetPrivateProfileIntW(L"FastBar", L"Running", 0, g_ini))   /* FastBar did not clean up */
             restoreTaskbar();
         return 0;

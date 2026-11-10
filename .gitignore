@@ -3,3 +3,5 @@ FastBarGuard.exe
 FastBar.ini
 *.o
 tests/out/
+FastBarTap.dll
+FastBarTap.tmp

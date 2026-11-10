@@ -81,6 +81,8 @@ static void winInfo(FILE *f, HWND h, const char *tag)
     GetWindowRect(h, &r);
     if (pGLWA && (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_LAYERED)) pGLWA(h, &k, &a, &fl);
     fprintf(f, " %s=%d,%d v%d a%d", tag, (int)r.left, (int)r.top, IsWindowVisible(h) ? 1 : 0, a);
+    /* FastBar's see-through overlays (TransparentTaskbar=1) do not hide what is under them */
+    if (GetPropW(h, L"FastBarSeeThrough")) fprintf(f, " s");
 }
 
 static void saveBmp(const char *path, HDC dc, HBITMAP bmp, int w, int h)

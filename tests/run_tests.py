@@ -21,6 +21,9 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+from shell_tests import SHELL_TESTS  # noqa: E402
+
 ROOT = os.path.dirname(HERE)
 OUT = os.path.join(HERE, "out")
 PROBE = os.path.join(OUT, "probe.exe")
@@ -39,6 +42,12 @@ SCENARIOS = [
     ("edge-wobble", 900, "same, drifting up to 15 px up and down (ShowDelay)"),
     ("edge-pull", 900, "real mouse: pull down past the edge, keep pushing"),
     ("edge-pull-sweep", 900, "real mouse: pull down, then left/right pressing down"),
+    ("tray", None, "tray's hidden icons stay open with the cursor moving along the bar"),
+    ("fullscreen", None, "bar stays away over a full-screen browser (opens Chrome/Edge)"),
+    ("win-flyout", None, "over a full-screen-like window: Win, flyout, back on the bar"),
+    ("resolution", None, "resolution changes (temporarily): the bar keeps fitting the screen"),
+    ("menus", None, "a menu opened from the bar keeps it up while open, not after"),
+    ("keyboard", None, "Win+T / Win+B bring the bar up and keep it live"),
 ]
 
 user32 = ctypes.windll.user32
@@ -121,6 +130,7 @@ def read_bmp(path):
 
 LINE = re.compile(r"\s*([\d.]+) tb=(-?\d+),(-?\d+) v(\d) a(\d+)(.*)")
 OV = re.compile(r"ov=(-?\d+),(-?\d+) v1 a(\d+)")
+OV_OPAQUE = re.compile(r"ov=(-?\d+),(-?\d+) v1 a(\d+)(?! s)")   # see-through ones end in " s"
 
 
 def read_log(path):
@@ -133,7 +143,8 @@ def read_log(path):
             m = LINE.match(line)
             if m:
                 frames.append(dict(t=float(m[1]), tbx=int(m[2]), tby=int(m[3]), tbv=int(m[4]),
-                                   tba=int(m[5]), ov=[(int(a), int(b), int(c)) for a, b, c in OV.findall(m[6])]))
+                                   tba=int(m[5]), ov=[(int(a), int(b), int(c)) for a, b, c in OV.findall(m[6])],
+                               cover=bool(OV_OPAQUE.findall(m[6]))))
     g = re.search(r"bar (-?\d+),(-?\d+),(-?\d+),(-?\d+)", header)
     top = int(g[2]) if g else None
     return frames, top
@@ -148,7 +159,8 @@ def analyse(name, flyout, frames, top, kymo):
 
     # 1. Explorer's own 30 fps animation must never be what is on screen:
     #    the real bar visible, opaque, part-way, with no overlay over it
-    explorer = [f["t"] for f in frames if f["tbv"] and f["tba"] > 1 and f["tby"] != top and not f["ov"]]
+    #    (a see-through overlay of TransparentTaskbar=1 does not hide it)
+    explorer = [f["t"] for f in frames if f["tbv"] and f["tba"] > 1 and f["tby"] != top and not f["cover"]]
     if explorer:
         fails.append("Explorer's own animation visible in %d frames (from %.0f ms)" % (len(explorer), explorer[0]))
 
@@ -160,10 +172,16 @@ def analyse(name, flyout, frames, top, kymo):
             fails.append("real bar visible while moving under overlay in %d frames (from %.0f ms)" % (len(ghost), ghost[0]))
 
     # 3. the frozen picture must stay perfectly still on screen until our
-    #    slide starts (anything changing = something showing through)
+    #    slide starts (anything changing = something showing through).
+    #    Not with TransparentTaskbar=1: the picture is see-through by design,
+    #    and it is excluded from screen captures while it is being made.
     w, h, px = kymo
+    if ini_int("TransparentTaskbar", 0):
+        frames_check3 = []
+    else:
+        frames_check3 = frames[:w]
     ref, changed = None, []
-    for i, f in enumerate(frames[:w]):
+    for i, f in enumerate(frames_check3):
         if not f["ov"]:
             if ref is not None:
                 break
@@ -230,6 +248,7 @@ def analyse_edge(path, slack=100):
                 if m and phases:
                     phases[-1][3].append(dict(t=float(m[1]), y=int(m[3]), v=int(m[4]), a=int(m[5]),
                                               ov=bool(OV.findall(m[6])),
+                                              cover=bool(OV_OPAQUE.findall(m[6])),
                                               cy=int(c[2]) if c else None))
     if top is None or not phases:
         return ["no data"], notes
@@ -254,7 +273,7 @@ def analyse_edge(path, slack=100):
             hidden += 1
         # a few pixels for a frame or two is the time it takes to notice
         # Explorer moving the bar; more is a visible second taskbar
-        if any(x["v"] and x["a"] > 1 and x["y"] - top > 12 for x in fr):
+        if any(x["v"] and x["a"] > 1 and x["y"] - top > 12 and not x["cover"] for x in fr):
             shift += 1
     if stuck:
         fails.append("bar did not come up in %d edge touches" % stuck)
@@ -300,6 +319,16 @@ def main():
     failed = 0
     for name, period, desc in todo:
         tag = name + ("-%d" % period if period and period > 0 else "")
+        if name in SHELL_TESTS:
+            fails, notes = SHELL_TESTS[name]()
+            skipped = not fails and any(n.startswith("skipped") for n in notes)
+            print("%-14s %s  - %s" % (tag, "SKIP" if skipped else "PASS" if not fails else "FAIL", desc))
+            for n in notes:
+                print("               " + n)
+            for x in fails:
+                print("               ! " + x)
+            failed += bool(fails)
+            continue
         prefix = os.path.join(OUT, tag)
         cmd = [PROBE, name, prefix] + ([str(period)] if period else [])
         r = subprocess.run(cmd)
