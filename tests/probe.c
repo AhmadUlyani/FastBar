@@ -31,7 +31,8 @@
  *              cursor resting on the edge)
  * writes <outprefix>.log (one line per frame) and <outprefix>.bmp (kymograph)
  *
- * log line: "<ms> tb=<x>,<y> v<visible> a<alpha> [ov=<x>,<y> v1 a<alpha>]..."
+ * log line: "<ms> tb=<x>,<y> v<visible> a<alpha> [ov=<x>,<y> v1 a<alpha> s]..."
+ * (ov = FastBar's cover; y is where the live thumbnail in it is drawn)
  * marker lines start with "--" (cursor moves); the header gives geometry.
  */
 #define UNICODE
@@ -79,9 +80,12 @@ static void winInfo(FILE *f, HWND h, const char *tag)
     RECT r = { 0 };
     BYTE a = 255; DWORD fl = 0; COLORREF k;
     GetWindowRect(h, &r);
+    /* FastBar's cover stands still: the live thumbnail in it slides, this far */
+    r.top += (int)(INT_PTR)GetPropW(h, L"FastBarSlide");
     if (pGLWA && (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_LAYERED)) pGLWA(h, &k, &a, &fl);
     fprintf(f, " %s=%d,%d v%d a%d", tag, (int)r.left, (int)r.top, IsWindowVisible(h) ? 1 : 0, a);
-    /* FastBar's see-through overlays (TransparentTaskbar=1) do not hide what is under them */
+    /* FastBar's cover is see-through: it does not hide what is under it.
+       (Without this property it is up but empty, ready to show the bar.) */
     if (GetPropW(h, L"FastBarSeeThrough")) fprintf(f, " s");
 }
 
@@ -205,8 +209,8 @@ static int edgeScenario(const char *out, int dwell, int jitter)
                 if (jitter == 1 && inside && j == 1 && ms - start >= 100) { moveTo(x, SH - 1); j = 2; }
                 fprintf(f, "%7.1f", ms);
                 winInfo(f, tb, "tb");
-                while ((h = FindWindowExW(NULL, h, L"FastBarSnapshot", NULL)) != NULL)
-                    if (IsWindowVisible(h)) winInfo(f, h, "ov");
+                while ((h = FindWindowExW(NULL, h, L"FastBarOverlay", NULL)) != NULL)
+                    if (IsWindowVisible(h) && GetPropW(h, L"FastBarSeeThrough")) winInfo(f, h, "ov");
                 {
                     POINT c;
                     GetCursorPos(&c);
@@ -305,8 +309,8 @@ int main(int argc, char **argv)
         BitBlt(mdc, frames, 0, 1, regH, sdc, colX, SH - regH, SRCCOPY);
         fprintf(f, "%7.1f", ms);
         winInfo(f, tb, "tb");
-        while ((h = FindWindowExW(NULL, h, L"FastBarSnapshot", NULL)) != NULL)
-            if (IsWindowVisible(h)) winInfo(f, h, "ov");
+        while ((h = FindWindowExW(NULL, h, L"FastBarOverlay", NULL)) != NULL)
+            if (IsWindowVisible(h) && GetPropW(h, L"FastBarSeeThrough")) winInfo(f, h, "ov");
         fprintf(f, "\n");
         if (back && !done && ms > 150) { moveTo(x, onBarY); done = 1; fprintf(f, "--back\n"); }
         if (rapid && ms < 2000) {

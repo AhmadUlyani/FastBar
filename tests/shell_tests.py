@@ -111,10 +111,11 @@ def bar_up():
 def overlays():
     n, h = 0, None
     while True:
-        h = user32.FindWindowExW(None, h, "FastBarSnapshot", None)
+        h = user32.FindWindowExW(None, h, "FastBarOverlay", None)
         if not h:
             return n
-        n += bool(user32.IsWindowVisible(h))
+        # (up without this property: empty, only ready to show the bar)
+        n += bool(user32.IsWindowVisible(h) and user32.GetPropW(h, "FastBarSeeThrough"))
 
 
 def overflow_open():
@@ -321,7 +322,7 @@ def run_fullscreen_case(exe, maximized):
             slid += overlays() > 0
             time.sleep(0.008)
         if slid:
-            fails.append("a picture was shown while hiding for full screen (%s, %d samples)" % (tag, slid))
+            fails.append("a slide was shown while hiding for full screen (%s, %d samples)" % (tag, slid))
         if bar_up():
             fails.append("bar still up after going full screen (%s)" % tag)
         away()
@@ -334,7 +335,7 @@ def run_fullscreen_case(exe, maximized):
 
 def bar_on_top():
     """the real bar is what is at the middle of the bar's area (click-through
-    pictures of FastBar do not count), not a window that covers it"""
+    FastBar's cover does not count), not a window that covers it"""
     tb = user32.FindWindowW("Shell_TrayWnd", None)
     r = rect(tb)
     pt = wt.POINT((r.left + r.right) // 2, (r.top + r.bottom) // 2)
@@ -537,7 +538,7 @@ SHELL_TESTS["resolution"] = run_resolution
 
 # ------------------------------------------------------------ menus, keys
 def bar_seen():
-    """the bar is on screen: the live bar on top, or FastBar's picture of it"""
+    """the bar is on screen: the live bar on top, or FastBar's cover showing it"""
     return (bar_up() and bar_on_top()) or overlays() > 0
 
 
@@ -629,7 +630,7 @@ def run_keyboard():
                 time.sleep(0.25)
                 bad += not (bar_up() and bar_on_top()) or overlays() > 0
             if bad:
-                fails.append("%s: bar missing or frozen in %d of 5 samples" % (tag, bad))
+                fails.append("%s: bar missing or under the cover in %d of 5 samples" % (tag, bad))
             click()                             # focus to the test window
             time.sleep(1.0)
             if bar_seen():

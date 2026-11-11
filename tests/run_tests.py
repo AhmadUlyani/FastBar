@@ -158,8 +158,8 @@ def analyse(name, flyout, frames, top, kymo):
         return ["no data"], notes
 
     # 1. Explorer's own 30 fps animation must never be what is on screen:
-    #    the real bar visible, opaque, part-way, with no overlay over it
-    #    (a see-through overlay of TransparentTaskbar=1 does not hide it)
+    #    the real bar visible, opaque, part-way (FastBar's cover is see-through
+    #    and does not hide it)
     explorer = [f["t"] for f in frames if f["tbv"] and f["tba"] > 1 and f["tby"] != top and not f["cover"]]
     if explorer:
         fails.append("Explorer's own animation visible in %d frames (from %.0f ms)" % (len(explorer), explorer[0]))
@@ -171,34 +171,7 @@ def analyse(name, flyout, frames, top, kymo):
         if ghost:
             fails.append("real bar visible while moving under overlay in %d frames (from %.0f ms)" % (len(ghost), ghost[0]))
 
-    # 3. the frozen picture must stay perfectly still on screen until our
-    #    slide starts (anything changing = something showing through).
-    #    Not with TransparentTaskbar=1: the picture is see-through by design,
-    #    and it is excluded from screen captures while it is being made.
-    w, h, px = kymo
-    if ini_int("TransparentTaskbar", 0):
-        frames_check3 = []
-    else:
-        frames_check3 = frames[:w]
-    ref, changed = None, []
-    for i, f in enumerate(frames_check3):
-        if not f["ov"]:
-            if ref is not None:
-                break
-            continue
-        if any(y != top for _, y, _ in f["ov"]):
-            break
-        col = [px[y][i] for y in range(h)]
-        if ref is None:
-            ref = col
-            continue
-        d = sum(1 for a, b in zip(ref, col) if sum(abs(p - q) for p, q in zip(a, b)) > 30)
-        if d:
-            changed.append(f["t"])
-    if changed:
-        fails.append("screen changed under the frozen bar in %d frames (from %.0f ms)" % (len(changed), changed[0]))
-
-    # 4. single hides (app/qs/cal): our slide runs every frame, ends hidden
+    # 3. single hides (app/qs/cal): our slide runs every frame, ends hidden
     if "-" not in name:
         ys = [(f["t"], max(y for _, y, _ in f["ov"])) for f in frames if f["ov"]]
         moving = [(t, y) for t, y in ys if y != top]

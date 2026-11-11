@@ -9,15 +9,17 @@ about 30 fps, so the slide often stutters. FastBar replaces that behavior:
   bottom edge of the screen. The built-in auto-hide takes about 200–400 ms.
 - **Animation at your refresh rate**: every frame is synced to the desktop compositor
   (`DwmFlush`), so on a 144 Hz monitor the slide runs at 144 fps.
-- **Live content**: the slide shows the taskbar's real, current content, rendered by
-  the GPU the same way Alt+Tab previews are.
+- **Live content**: every slide, in and out, shows the real taskbar with its current
+  content, rendered by the GPU the same way Alt+Tab previews are. No picture of the
+  taskbar is ever taken.
 - **Lightweight**: native C/Win32, ~75 KB executable (mostly the icon), ~2 MB of RAM, ~0% CPU when idle.
   It is event-driven (see below for the one exception).
 
 ## Usage
 
 1. Keep `FastBar.exe`, `FastBarGuard.exe` and `FastBarTap.dll` in the same folder and run
-   `FastBar.exe`. (`FastBarTap.dll` is only needed for **Transparent taskbar**.)
+   `FastBar.exe`. (`FastBarTap.dll` is needed for **Transparent taskbar**, and it keeps
+   Explorer from moving the taskbar on its own. FastBar also works without it.)
    Its icon appears in the system tray.
    On launch FastBar adds itself to the Start menu (`FastBar.lnk` in your user's
    Start menu *Programs* folder), so next time you can just type "FastBar" in
@@ -64,12 +66,24 @@ first run. After editing it, choose **Reload settings** from the tray menu.
 - Windows' auto-hide setting is turned on, so maximized windows use the whole screen.
   The real taskbar window is then hidden, so Explorer's own slow auto-hide logic never
   runs.
-- **Showing.** The real taskbar is shown immediately, standing still at its final
-  position. Explorer processes hover on every frame when the bar moves under the
-  cursor, which stalls the animation, so the bar itself never moves. On top of it,
-  FastBar plays the slide in its own click-through window, using a live DWM thumbnail
-  of the real taskbar. When the slide ends, that window goes away. Clicks during the
-  slide already reach the real taskbar.
+- **The real taskbar never moves.** Explorer processes hover on every frame when the
+  bar moves under the cursor, which stalls the animation. So the real bar stands still
+  at its final position, and every slide is played on top of it by a window of
+  FastBar's own, the cover: click-through and see-through, it holds nothing but a live
+  DWM thumbnail of the real taskbar, drawn at the slide's current offset. Meanwhile the
+  real bar is transparent (alpha 1/255, so it still takes clicks and keeps rendering
+  for the thumbnail). What you see sliding is the taskbar itself, over whatever is
+  behind it at that moment.
+- **Showing.** The real taskbar is shown immediately (transparent), the cover slides
+  its thumbnail up, and when the slide ends the two swap: the real bar turns opaque
+  and the cover goes away. Clicks during the slide already reach the real taskbar.
+- **Hiding.** The other way round: the cover takes the bar over, slides its thumbnail
+  down, and only then is the real taskbar window hidden. A hide that is turned around
+  half-way just slides back up. Explorer's ~30 fps hide animation is never used.
+- **The swap takes one frame.** The cover is put up ahead of time, fully transparent,
+  and the taskbar is made a layered window; then only two alpha values change, right
+  after a frame. Both showing at once would draw the bar's see-through parts twice (the
+  Search box flashes brighter), neither would make the bar blink.
 - In auto-hide mode, Explorer hides the taskbar's content by hiding a child window
   (`Windows.UI.Composition.DesktopWindowContentBridge`). Explorer would only show it
   again 40–90 ms after the cursor arrives, so FastBar shows it right away and the
@@ -80,11 +94,14 @@ first run. After editing it, choose **Reload settings** from the tray menu.
   restart its own unhide animation.
 - While Start or Quick Settings is open, Windows moves the taskbar to a higher z-band,
   above every normal window, and sometimes leaves it there afterwards. No window of
-  FastBar's can cover it then. So during the slide, the real taskbar is made
-  transparent (alpha 1/255, so it still takes clicks and keeps rendering for the live
-  thumbnail), and it becomes opaque again when the slide ends.
-- **Hiding.** A snapshot of the taskbar slides down in FastBar's own window. Explorer's
-  ~30 fps hide animation is never used.
+  FastBar's can cover it then, which is one more reason the real bar is made
+  transparent during a slide instead of being covered.
+- **While the cursor is away.** In auto-hide mode Explorer wants to hide the taskbar by
+  itself about half a second after the cursor leaves it. During FastBar's hide delay
+  and slide the bar is pinned (see below), so Explorer cannot move it or hide its
+  content, and the thumbnail stays live. While Quick Settings or the calendar keeps the
+  bar up, the cover shows it and Explorer is left free to move the (transparent) real
+  bar: that move is the signal that ends the wait, and FastBar then plays its own hide.
 - **Programs running as administrator.** While a window of an elevated program (Task
   Manager, an admin console, ...) is in the foreground, Windows does not deliver mouse
   events to FastBar's low-level mouse hook. For as long as such a window is in front,
@@ -102,18 +119,13 @@ first run. After editing it, choose **Reload settings** from the tray menu.
   `rundll32`). The DLL only sets the `Fill` of those two rectangles, and puts Explorer's
   own brush back when transparency is turned off, FastBar exits, or FastBar is killed (the
   guard does it then). Once loaded, the DLL stays in Explorer until Explorer restarts.
-- **Slides of a see-through bar.** A picture of the bar taken from the screen would also
-  hold whatever is behind its clear background, and sliding it would drag that part of the
-  screen along. So the slide-in uses the live thumbnail on a see-through window, and the
-  picture used for hiding is taken twice, over a black and over a white backdrop placed
-  right behind the bar, which gives a picture of the bar alone with per-pixel alpha. While
-  that happens, an ordinary picture covers the bar on screen and is excluded from screen
-  captures (`WDA_EXCLUDEFROMCAPTURE`), so you never see the backdrop.
-
-- **Start closing with the cursor on the bar.** When Start or a flyout closes, Explorer
-  hides the bar by itself even with the cursor on it, content included, and cannot be
-  talked out of it. FastBar puts a picture in its place, makes the real bar invisible, and
-  shows it again at its place once that hide is over, so on screen nothing happens.
+- **Pin.** `FastBarTap.dll` also subclasses the taskbar window inside Explorer. While
+  FastBar asks for it (the cursor is on the bar, the bar waits to go, or it is sliding
+  out), Explorer's own attempts to move the taskbar or hide its content are refused, so
+  the real bar simply stays. Windows hides an auto-hide taskbar by itself when Start or
+  a flyout closes, even with the cursor on it; pinned, nothing happens on screen.
+- **See-through bar.** Nothing special is needed: the cover is see-through too, so a
+  taskbar with a clear background slides over the live screen behind it.
 
 ## Limitations
 
@@ -127,15 +139,13 @@ first run. After editing it, choose **Reload settings** from the tray menu.
 - To remove FastBar completely, also delete its Start menu shortcut:
   `%APPDATA%\Microsoft\Windows\Start Menu\Programs\FastBar.lnk`).
 - **Transparent taskbar:**
-  - Screen recorders and screen sharing (OBS, Teams, ...) can show a black / white strip
-    behind the taskbar for 2 frames when it starts hiding: they see the backdrop that the
-    picture covers on your monitor (see "Slides of a see-through bar").
-  - When the cursor goes in and out of the bar very quickly while Quick Settings or the
-    calendar is open, Explorer's own hide animation can show for a few frames.
   - The DLL is locked while Explorer has it loaded. To replace it (new build), restart
     Explorer, or sign out and in again.
   - Building `FastBarTap.dll` needs a 64-bit gcc (mingw-w64); `build.bat` looks for it in
     `D:\mingw64\bin` or in the `GCC64` environment variable.
+- Without `FastBarTap.dll` nothing stops Explorer from moving the taskbar while the
+  cursor is away. FastBar then lets the cover take over as soon as the cursor leaves,
+  and the bar can take longer to react right after it comes back up.
 - If both FastBar and FastBarGuard are killed, the taskbar can stay hidden. Run FastBar
   again and choose **Exit**, or restart Windows Explorer.
 
@@ -162,8 +172,7 @@ new build.
 `python tests\run_tests.py` drives the real mouse and keyboard against the
 running FastBar (show the bar, open Quick Settings / the calendar, leave, come
 back, go in and out quickly) and records every frame of what is on screen. It
-fails when Explorer's own animation shows, when something shows through the
-frozen bar, or when the slide stalls. Keep your hands off the mouse while it
+fails when Explorer's own animation shows or when the slide stalls. Keep your hands off the mouse while it
 runs. `--rebuild` runs `rebuild.bat` first; scenario names (`app`, `qs`, `cal`,
 `qs-back`, `qs-rapid`, `cal-rapid`, `edge`, `edge-jitter`, `edge-sweep`,
 `edge-wobble`, `edge-pull`, `edge-pull-sweep`) run only those. `edge` touches
@@ -176,6 +185,14 @@ and `edge-wobble` keep moving the mouse left and right along the bottom
 `edge-pull` and `edge-pull-sweep` move the mouse the way a real one does
 (relative steps that push past the screen edge) instead of placing the cursor. It needs gcc and Python 3,
 and assumes a bottom taskbar. Recordings go to `tests\out\`.
+
+`python tests\record.py e 900 o 1200` plays a small mouse script (`e` = touch the
+edge, `b` = onto the bar, `o` = leave, `q` / `n` = Quick Settings / calendar, `x` =
+Esc, a number = wait in ms) and records the screen's bottom strip on every frame. It
+fails when the bar looks different in any frame while it should stand fully shown,
+which is what a blink or a doubled bar at the swap between the real taskbar and its
+live thumbnail looks like, and it saves pictures of the frames around each swap. It
+needs numpy and Pillow, and nothing moving on screen behind the bar.
 
 ## License
 

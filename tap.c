@@ -19,8 +19,9 @@
  * Pin: when Start or a flyout closes, Explorer hides an auto-hide taskbar by
  * itself even with the cursor on it (Windows does this without FastBar too),
  * and no message from outside stops it. While pinned (FastBar: the cursor is
- * on the shown bar), the move and the hiding of its content are refused where
- * Explorer asks for them, so the real bar simply stays.
+ * on the shown bar, or the bar waits to go / is sliding out and its live
+ * thumbnail is what shows), the move and the hiding of its content are refused
+ * where Explorer asks for them, so the real bar simply stays.
  *
  * rundll32 entry point (FastBar starts 64-bit rundll32 for this):
  *   rundll32.exe FastBarTap.dll,Inject <ARGB hex | off>

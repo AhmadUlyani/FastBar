@@ -8,10 +8,10 @@
  * How it works:
  *   Windows "auto-hide" is enabled so the work area covers the full screen,
  *   but the real taskbar window is hidden (SW_HIDE) so Explorer's own slow
- *   auto-hide logic never fires. FastBar shows it itself and slides it with
- *   SetWindowPos(SWP_NOSENDCHANGING) once per DWM frame. When hiding, a
- *   snapshot of the taskbar is slid out in FastBar's own window, so Explorer's
- *   30 fps hide animation never runs.
+ *   auto-hide logic never fires. FastBar shows it itself, standing still at
+ *   its place, and plays every slide (in and out) in a see-through window of
+ *   its own on top, with a live DWM thumbnail of the real taskbar, once per
+ *   DWM frame. Explorer's 30 fps animations never show.
  */
 #define UNICODE
 #define _UNICODE
@@ -71,7 +71,7 @@
 /* desired states for the animation thread */
 #define D_HIDDEN 0
 #define D_SHOWN  1
-#define D_HOLD   2   /* cursor left: swap to snapshot, wait for hide delay */
+#define D_HOLD   2   /* cursor left: the bar stays up (live) for now, see animate() */
 
 /* main-thread modes */
 #define M_HIDDEN  0
@@ -446,7 +446,7 @@ static int fullscreenBehind(void)
 }
 
 /* Windows keeps the real bar below a full-screen window: shown there, it could
-   not be clicked, and a picture of it would hold what is on screen instead */
+   not be clicked */
 static int blockedFull(void)
 {
     return cfgBlockFull && fgIsFullscreen();
@@ -455,45 +455,74 @@ static int blockedFull(void)
 /* ===================================================================== */
 /* animation thread                                                       */
 /* ===================================================================== */
-typedef struct { HDC dc; HBITMAP bmp, old; int w, h; DWORD *bits; } Surface;  /* 32-bit top-down DIB */
-
-static HWND    a_snap;          /* picture of the taskbar that slides (bar sized) */
-static HWND    a_snapO, a_snapT; /* a_snap: opaque picture / with per-pixel alpha (a_tmode) */
-static HWND    a_back;          /* black / white backdrop for matteSnap() */
-static int     a_backWhite;
-static HWND    a_cover;         /* full bar area: background + sliding picture */
-static Surface a_snapS, a_coverBg;
-static Surface a_trueBg;        /* what was behind the bar at the last slide-in */
-static void copySurface(Surface *dst, Surface *src);
-static void showOverlay(HWND h, int x, int y, int w, int hh);
-static void keepOverlayOnTop(void);
+/*
+ * How the bar is put on screen
+ * ----------------------------
+ * The real taskbar never moves. Two facts about Explorer (Windows 11) force this:
+ *  - moving the real bar while the cursor is over it makes Explorer process hover
+ *    on every frame, stalling our SetWindowPos calls (~30 ms per frame);
+ *  - in auto-hide mode Explorer only draws the bar's content once the real cursor
+ *    has been over it (~80 ms later); it cannot be faked with window messages.
+ * So the real bar stands still at its full position, and every slide (in, out,
+ * and a slide that is turned around half-way) is played by a window of ours on
+ * top of it, the cover: click-through and see-through, it shows nothing but a
+ * live DWM thumbnail of the real bar, drawn at the slide's current offset.
+ * Meanwhile the real bar is invisible (alpha 1, so it keeps rendering for the
+ * thumbnail and still takes the clicks). No picture of the bar is ever taken:
+ * what slides is the taskbar itself, with its current content, over whatever
+ * is behind it right now.
+ *
+ *  C_REAL: the real bar, opaque, nothing of ours on screen.
+ *  C_COMP: the cover with the live thumbnail; the real bar is invisible under it.
+ *  a_prep: C_REAL, but the cover is already up, fully transparent, and the bar
+ *          is layered: the two then swap within one frame, by their alpha (two
+ *          calls of the same kind land in the same frame; a change of the
+ *          thumbnail next to a change of alpha may not).
+ */
+static HWND    a_cover;         /* full bar area, see-through: holds the live thumbnail */
 static int     a_carrier = C_NONE;
-/* See-through taskbar (TransparentTaskbar=1): the bar's background is clear,
-   so a picture of it taken from the screen also holds whatever was behind it,
-   and sliding that picture would drag that part of the screen along. So
-   slides are drawn with the live thumbnail only, on a cover that is itself
-   see-through (color key), and pictures are only used where they stand
-   still. Latched while the bar is at rest, so a slide never switches modes. */
-static int     a_tmode;
-/* does the picture in a_snapS show what is behind it (matteSnap) or not?
-   Also put on the overlay windows as a window property for tests/probe.c,
-   which cannot see it otherwise: only an opaque overlay hides the real bar. */
-static int a_snapSeeThru;
-#define SEE_THRU_PROP L"FastBarSeeThrough"
-#define COVER_KEY RGB(255, 0, 255)
-static void ovAlpha(HWND h, BYTE a)
-{
-    if (h == a_snapT) {                /* per-pixel alpha window: only its overall alpha */
-        BLENDFUNCTION bf = { AC_SRC_OVER, 0, a, AC_SRC_ALPHA };
-        UpdateLayeredWindow(h, NULL, NULL, NULL, NULL, NULL, 0, &bf, ULW_ALPHA);
-    } else if (h == a_cover && a_tmode) {
-        SetLayeredWindowAttributes(h, COVER_KEY, a, LWA_COLORKEY | LWA_ALPHA);
-    } else {
-        SetLayeredWindowAttributes(h, 0, a, LWA_ALPHA);
-    }
-}
 static double  a_p = 0.0;       /* 0 = hidden, 1 = shown */
 static DWORD   a_explorerHideUntil;
+static void keepOverlayOnTop(void);
+
+/* window properties of the cover for the tests, which cannot see a thumbnail
+   otherwise: the cover is showing the bar (it never hides what is under it),
+   and how far (pixels) the thumbnail is from the bar's place */
+#define SEE_THRU_PROP L"FastBarSeeThrough"
+#define SLIDE_PROP    L"FastBarSlide"
+#define COVER_KEY RGB(255, 0, 255)
+static void ovAlpha(BYTE a)
+{
+    SetLayeredWindowAttributes(a_cover, COVER_KEY, a, LWA_COLORKEY | LWA_ALPHA);
+    SetPropW(a_cover, SEE_THRU_PROP, (HANDLE)(INT_PTR)(a != 0));
+}
+
+/* The shield: over the bar's place, invisible (alpha 1) but solid to the
+   mouse. The cover is see-through to the mouse, so while Explorer has the real
+   bar away (pulled off its place and below a window it takes for full screen,
+   Riot Client, see guard) the cursor would be over that window: it takes that
+   window's shape, and a click would go there (activating it closes the tray's
+   hidden icons). Explorer does not answer for ~200 ms then, so the bar could
+   not take the click anyway. */
+#define SHIELD_MAX_MS 500
+static HWND  a_shield;
+static DWORD a_shieldSince;
+static void shieldOn(void)
+{
+    if (!a_shield) return;
+    SetWindowPos(a_shield, a_cover, g_shown.left, g_shown.top, g_shown.right - g_shown.left,
+                 g_shown.bottom - g_shown.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    a_shieldSince = GetTickCount();
+}
+static void shieldOff(void)
+{
+    if (a_shield && IsWindowVisible(a_shield)) ShowWindow(a_shield, SW_HIDE);
+}
+/* never for long: the real bar must take the clicks again */
+static void shieldCheck(void)
+{
+    if (a_shield && IsWindowVisible(a_shield) && GetTickCount() - a_shieldSince > SHIELD_MAX_MS) shieldOff();
+}
 
 /* progress (0..1) -> how much of the bar is out. Hiding runs the same curve
    backwards, so an ease-out appear becomes an ease-in (accelerating) hide. */
@@ -523,13 +552,6 @@ static void placeReal(double p)
     SetWindowPos(g_tb, NULL, x, y, 0, 0,
                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_NOOWNERZORDER);
 }
-static void placeSnap(double p)
-{
-    int x, y;
-    posAt(p, &x, &y);
-    SetWindowPos(a_snap, NULL, x, y, 0, 0,
-                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-}
 
 static void waitFrame(void)
 {
@@ -542,65 +564,12 @@ static void pumpMessages(void)
     while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
 }
 
-static void surfAlloc(Surface *s, int w, int h)
-{
-    BITMAPINFO bi;
-    HDC sdc = GetDC(NULL);
-    if (s->bmp) { SelectObject(s->dc, s->old); DeleteObject(s->bmp); }
-    if (!s->dc) s->dc = CreateCompatibleDC(sdc);
-    ZeroMemory(&bi, sizeof bi);
-    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    s->bits = NULL;
-    s->bmp = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, (void **)&s->bits, NULL, 0);
-    s->old = SelectObject(s->dc, s->bmp);
-    s->w = w; s->h = h;
-    ReleaseDC(NULL, sdc);
-}
-
-/* copy the screen area (x, y, taskbar size) into a surface; off-screen parts stay black */
-static void capture(Surface *s, int x, int y)
-{
-    int w = g_shown.right - g_shown.left, h = g_shown.bottom - g_shown.top;
-    RECT cur, vis;
-    HDC sdc = GetDC(NULL);
-    if (w != s->w || h != s->h || !s->bmp) surfAlloc(s, w, h);
-    PatBlt(s->dc, 0, 0, w, h, BLACKNESS);
-    SetRect(&cur, x, y, x + w, y + h);
-    if (IntersectRect(&vis, &cur, &g_mon))
-        BitBlt(s->dc, vis.left - x, vis.top - y, vis.right - vis.left, vis.bottom - vis.top,
-               sdc, vis.left, vis.top, SRCCOPY);
-    ReleaseDC(NULL, sdc);
-}
-
-/*
- * How the bar is put on screen
- * ----------------------------
- * The real taskbar never moves. Two facts about Explorer (Windows 11) force this:
- *  - moving the real bar while the cursor is over it makes Explorer process hover
- *    on every frame, stalling our SetWindowPos calls (~30 ms per frame);
- *  - in auto-hide mode Explorer only draws the bar's content once the real cursor
- *    has been over it (~80 ms later); it cannot be faked with window messages.
- * So the real bar is shown, still, at its full position as soon as the cursor
- * touches the edge (Explorer starts drawing it), while a click-through window of
- * ours on top plays the slide using a picture of the bar. When the slide is done
- * and Explorer has had time to draw, our window goes away.
- *
- *  C_SNAP: a_snap (picture of the bar, bar sized) moves. Used for hiding, and for
- *          showing again when a hide is reversed half-way.
- *  C_COMP: a_cover (full bar area) paints the background behind the bar plus the
- *          picture at the current offset. Used for a normal slide-in.
- *  a_realUnder: the real bar is shown underneath the overlay.
- */
-static int     a_realUnder;
-static int     a_snapValid;      /* the moving picture was taken of the full bar */
-static DWORD   a_thumbFrom;      /* live thumbnail is shown from this time on */
-#define REDRAW_MS 60             /* Explorer redraws a re-shown bar within a few frames */
-static DWORD   a_revealAt;       /* earliest time the overlay may be removed */
+static int     a_realUnder;      /* the real bar is shown (invisible) under the cover */
+static int     a_prep;           /* see above */
+static int     a_hidePending;    /* the bar is off screen but could not be hidden yet (hideReal) */
+static int     a_left;           /* the cursor has been away since the bar came up */
+static DWORD   a_thumbFrom;      /* the thumbnail has been showing since this time */
+static DWORD   a_revealAt;       /* earliest time the cover may be removed */
 #define REVEAL_MS 40             /* a few frames for Explorer to settle */
 
 /* In auto-hide mode Explorer hides the taskbar's content by hiding this child
@@ -611,12 +580,18 @@ static void showContent(void)
     HWND br = FindWindowExW(g_tb, NULL, L"Windows.UI.Composition.DesktopWindowContentBridge", NULL);
     if (br && !IsWindowVisible(br)) ShowWindow(br, SW_SHOWNA);
 }
+static int contentShown(void)
+{
+    HWND br = FindWindowExW(g_tb, NULL, L"Windows.UI.Composition.DesktopWindowContentBridge", NULL);
+    return !br || IsWindowVisible(br);
+}
 
-/* Opacity of the real taskbar window. While Start or Quick Settings is (or
-   was) open, Windows can keep the taskbar in a z-band above every normal
-   window, where no overlay of ours can cover it. So during a slide the real
-   bar is made transparent instead (it keeps rendering, so its live thumbnail
-   still shows the content), and opaque again when the slide is done.
+/* Opacity of the real taskbar window. During a slide the real bar stands at
+   its full position while the cover draws it somewhere else, so it is made
+   transparent (it keeps rendering, so its live thumbnail still shows the
+   content), and opaque again when the slide is done. No window of ours could
+   hide it instead: while Start or Quick Settings is (or was) open, Windows can
+   keep the taskbar in a z-band above every normal window.
    The alpha is 1, not 0: a fully transparent window no longer takes clicks. */
 #define TB_INVISIBLE 1
 static int g_tbLayeredByUs;
@@ -636,12 +611,15 @@ static void tbAlpha(BYTE a)
     SetLayeredWindowAttributes(g_tb, 0, a, LWA_ALPHA);
     g_tbAlpha = a;
 }
-/* While a flyout (Quick Settings, calendar...) is open, the bar is kept
-   layered at full opacity. Making a window layered waits for Explorer to
-   handle the style change, which takes a few frames while it is busy; then
-   the bar could show above our picture for those frames when it is frozen.
-   Already layered, only the alpha changes, which is immediate. */
+/* The bar is made layered, at full opacity, ahead of a swap with the cover.
+   Making a window layered waits for Explorer to handle the style change,
+   which takes a few frames while it is busy. Already layered, only the alpha
+   changes, which is immediate. */
 static volatile LONG g_wantLayer;
+/* D_HOLD: the bar waits to go and is pinned (1), or a flyout keeps it up, and
+   only Explorer hiding it by itself ends that: not pinned (0) */
+static volatile LONG g_holdPinned;
+static volatile LONG g_tapPinned = -1;   /* what FastBarTap.dll was told last (tapPin); -1: not yet */
 static void tbPrelayer(void)
 {
     if (!g_tb) return;
@@ -667,8 +645,7 @@ static void tbAlphaRestore(void)
 
 /* Windows keeps the real bar below a window it takes for full screen (Riot
    Client, a browser). Start lifts it, but when a tray flyout replaces Start the
-   bar is back below that window, while a click-through picture of ours still
-   shows it. Without the picture the bar would seem to vanish, under the cursor. */
+   bar is back below that window. */
 static int barCovered(void)
 {
     POINT c;
@@ -707,8 +684,7 @@ static int realAtFull(void)
 static DWORD a_showStart;
 #define NATIVE_TIMEOUT_MS 700
 
-/* Show the real bar underneath an overlay.
-   Explorer keeps its own "hidden / shown" auto-hide state. If the bar is only
+/* Explorer keeps its own "hidden / shown" auto-hide state. If the bar is only
    put on screen while Explorer thinks it is hidden, the first click on it makes
    Explorer restart its own unhide (the bar jumps away and crawls back up).
    A WM_ACTIVATE message (not a real activation: focus stays where it is) makes
@@ -728,22 +704,21 @@ static void syncExplorerShown(void)
     PostMessageW(g_tb, WM_ACTIVATE, WA_INACTIVE, 0);
 }
 
-static void realUnder(int on)
+/* show the real bar, invisible, under the cover */
+static void realUnder(void)
 {
-    if (on && !a_realUnder) {
-        tbAlpha(TB_INVISIBLE);             /* invisible until the overlay goes */
+    if (!a_realUnder) {
+        tbAlpha(TB_INVISIBLE);             /* invisible until the cover goes */
         showRealFull();
         syncExplorerShown();
         keepOverlayOnTop();
         a_showStart = GetTickCount();
         a_revealAt = a_showStart + REVEAL_MS;
-    } else if (!on && a_realUnder) {
-        ShowWindow(g_tb, SW_HIDE);
     }
-    a_realUnder = on;
+    a_realUnder = 1;
 }
 
-/* may the overlay go away now? */
+/* may the cover go away now? */
 static int realReady(void)
 {
     if ((LONG)(GetTickCount() - a_revealAt) < 0) return 0;
@@ -756,20 +731,29 @@ static int realReady(void)
     return 0;
 }
 
-/* The cover shows what was on screen behind the bar, with a live DWM
-   thumbnail of the real bar (its actual current content) on top. */
-static HANDLE  a_thumb;
-
-/* See-through bar: an overlay leaves the screen through its alpha first.
-   ShowWindow(SW_HIDE) lands a frame later than a change of alpha or of a
-   thumbnail, and for that frame the bar would be drawn twice (the Search box
-   flashes brighter). The window itself is hidden a frame later. */
-static int a_snapGoing;
-static void snapGo(void)
+/* the real bar under the cover stays invisible and keeps its content, whatever
+   Explorer does to it meanwhile (its own auto-hide can run under the cover:
+   it may drop the layered style, and it hides the content when it is done) */
+static void keepUnder(void)
 {
-    ovAlpha(a_snap, 0);
-    a_snapGoing = 1;
+    if (!a_realUnder || !g_tb) return;
+    if (!(GetWindowLongW(g_tb, GWL_EXSTYLE) & WS_EX_LAYERED)) {
+        DBG(("keepUnder: layered style was dropped t=%lu\r\n", GetTickCount()));
+        tbAlpha(TB_INVISIBLE);
+    }
+    showContent();
+    /* Explorer can still be busy with a hide of its own when the bar comes
+       (back) up, and go on moving it: off its place it would not take the
+       clicks. Pinned, it stays where it is put. */
+    if (g_desired != D_HIDDEN && g_tapPinned == 1 && !realAtFull()) {
+        DBG(("keepUnder: bar put back t=%lu\r\n", GetTickCount()));
+        showRealFull();
+    }
 }
+
+/* ---------- the cover and its live thumbnail ---------- */
+static HANDLE  a_thumb;
+static HWND    a_thumbOf;
 
 static void thumbOff(void)
 {
@@ -777,334 +761,147 @@ static void thumbOff(void)
     a_thumb = NULL;
 }
 
-static void paintCover(void)
+/* the thumbnail at progress a_p */
+static void thumbSet(void)
 {
-    if (a_thumb && pDwmUpdThumb) {
-        THUMBPROPS tp;
-        int x, y;
-        posAt(a_p, &x, &y);
-        ZeroMemory(&tp, sizeof tp);
-        tp.dwFlags = TNP_RECTDESTINATION | TNP_OPACITY | TNP_VISIBLE | TNP_CLIENTONLY;
-        tp.rcDestination.left = x - g_shown.left;
-        tp.rcDestination.top = y - g_shown.top;
-        tp.rcDestination.right = tp.rcDestination.left + (g_shown.right - g_shown.left);
-        tp.rcDestination.bottom = tp.rcDestination.top + (g_shown.bottom - g_shown.top);
-        tp.opacity = 255;
-        tp.fVisible = (LONG)(GetTickCount() - a_thumbFrom) >= 0;
-        tp.fSourceClientAreaOnly = FALSE;
-        pDwmUpdThumb(a_thumb, &tp);
-        /* see-through: the picture under the cover goes as the live bar
-           appears (both would draw the bar twice) */
-        if (a_tmode && tp.fVisible && IsWindowVisible(a_cover) && IsWindowVisible(a_snap)) {
-            DBG(("paintCover hides snap t=%lu\r\n", GetTickCount()));
-            if (a_snapGoing) {
-                ShowWindow(a_snap, SW_HIDE);
-                a_snapGoing = 0;
-            } else {
-                snapGo();
-            }
-        }
-    }
-    InvalidateRect(a_cover, NULL, FALSE);
-    UpdateWindow(a_cover);
+    THUMBPROPS tp;
+    int x, y;
+    if (!a_thumb || !pDwmUpdThumb) return;
+    posAt(a_p, &x, &y);
+    ZeroMemory(&tp, sizeof tp);
+    tp.dwFlags = TNP_RECTDESTINATION | TNP_OPACITY | TNP_VISIBLE | TNP_CLIENTONLY;
+    tp.rcDestination.left = x - g_shown.left;
+    tp.rcDestination.top = y - g_shown.top;
+    tp.rcDestination.right = tp.rcDestination.left + (g_shown.right - g_shown.left);
+    tp.rcDestination.bottom = tp.rcDestination.top + (g_shown.bottom - g_shown.top);
+    tp.opacity = 255;
+    tp.fVisible = TRUE;
+    tp.fSourceClientAreaOnly = FALSE;
+    pDwmUpdThumb(a_thumb, &tp);
+    SetPropW(a_cover, SLIDE_PROP, (HANDLE)(INT_PTR)((x - g_shown.left) + (y - g_shown.top)));
 }
 
-/* put the cover (background + live thumbnail at progress a_p) on screen */
-static int coverOn(void)
+/* Put the cover on screen, its thumbnail at progress a_p. A window that is
+   shown again first appears with what it showed last time, for one frame; so
+   it is shown fully transparent, painted, and only then made opaque (showing),
+   or left transparent for now (see a_prep). */
+static int coverUp(int showing)
 {
-    thumbOff();
-    if (!pDwmRegThumb || FAILED(pDwmRegThumb(a_cover, g_tb, &a_thumb))) {
-        a_thumb = NULL;
-        return 0;
+    RECT r;
+    if (a_thumb && a_thumbOf != g_tb) thumbOff();
+    if (!a_thumb) {
+        if (!pDwmRegThumb || FAILED(pDwmRegThumb(a_cover, g_tb, &a_thumb))) {
+            a_thumb = NULL;
+            return 0;
+        }
+        a_thumbOf = g_tb;
     }
-    paintCover();                      /* thumbnail position before it shows */
-    SetPropW(a_cover, SEE_THRU_PROP, (HANDLE)(INT_PTR)a_tmode);   /* see a_snapSeeThru */
-    showOverlay(a_cover, g_shown.left, g_shown.top, a_coverBg.w, a_coverBg.h);
+    thumbSet();
+    if (!IsWindowVisible(a_cover) || !GetWindowRect(a_cover, &r) || !EqualRect(&r, &g_shown)) {
+        ovAlpha(0);
+        SetWindowPos(a_cover, HWND_TOPMOST, g_shown.left, g_shown.top, g_shown.right - g_shown.left,
+                     g_shown.bottom - g_shown.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        RedrawWindow(a_cover, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
+        waitFrame();
+    }
+    if (showing) ovAlpha(255);
+    return 1;
+}
+
+static void coverDown(void)
+{
+    shieldOff();
+    if (IsWindowVisible(a_cover)) ShowWindow(a_cover, SW_HIDE);
+    thumbOff();
+    a_prep = 0;
+}
+
+/* The cursor left the real bar (or a flyout is open): get ready to take the
+   bar over. Nothing changes on screen. */
+static int coverPrep(void)
+{
+    tbPrelayer();
+    if (!coverUp(0)) return 0;
+    a_prep = 1;
     return 1;
 }
 
 /* Explorer raises the real bar to the top of the "always on top" windows
    once the cursor is over it (and when a Quick Settings / calendar panel is
-   open), which would put it above our overlay in the middle of a slide.
-   Keep our overlay on top, every frame while it is shown. */
+   open), which would put it above the cover in the middle of a slide. That
+   only matters for the bar's clicks; keep the cover on top all the same. */
 static void keepOverlayOnTop(void)
 {
-    HWND h = a_carrier == C_COMP ? a_cover : a_carrier == C_SNAP ? a_snap : NULL;
-    if (h && IsWindowVisible(h) && GetWindow(h, GW_HWNDPREV) != NULL)
-        SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+    if (a_carrier == C_COMP && IsWindowVisible(a_cover) && GetWindow(a_cover, GW_HWNDPREV) != NULL)
+        SetWindowPos(a_cover, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
                      SWP_NOOWNERZORDER);
 }
 
-static void hideOverlay(void)
+static int a_explSeen;           /* Explorer's own hide already reported */
+
+/* The real bar (shown, opaque) -> the cover with its live thumbnail at the
+   same spot, within one frame. The bar's see-through parts (the Search box, a
+   see-through background) drawn by both would flash brighter; drawn by
+   neither, the bar would blink.
+   urgent: Explorer is already moving the bar by itself, which must not show. */
+static int realToCover(int urgent)
 {
-    if (a_carrier == C_COMP) {
-        ShowWindow(a_cover, SW_HIDE);
-        thumbOff();
-        if (IsWindowVisible(a_snap)) ShowWindow(a_snap, SW_HIDE);
-    } else if (a_carrier == C_SNAP) {
-        ShowWindow(a_snap, SW_HIDE);
+    if (!a_prep) {
+        if (urgent) tbAlpha(TB_INVISIBLE);
+        else tbPrelayer();
+        if (!coverUp(0)) {
+            DBG(("realToCover: no cover t=%lu\r\n", GetTickCount()));
+            if (urgent) tbAlpha(255);
+            return 0;
+        }
     }
-}
-
-/* Show one of our overlay windows with its new content. A window that is
-   shown again first appears with what it showed last time, for one frame;
-   so it is shown fully transparent, painted, and only then made opaque. */
-static int a_realUnderShown(void)
-{
-    return a_carrier == C_REAL && IsWindowVisible(g_tb);
-}
-static void showOverlay(HWND h, int x, int y, int w, int hh)
-{
-    if (h == a_snap) a_snapGoing = 0;
-    if (h == a_snapT) {
-        /* content and position in one go, so no stale frame shows */
-        POINT pt, org = { 0, 0 };
-        SIZE sz;
-        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-        HDC sdc = GetDC(NULL);
-        pt.x = x; pt.y = y; sz.cx = w; sz.cy = hh;
-        UpdateLayeredWindow(h, sdc, &pt, &sz, a_snapS.dc, &org, 0, &bf, ULW_ALPHA);
-        ReleaseDC(NULL, sdc);
-        SetPropW(h, SEE_THRU_PROP, (HANDLE)(INT_PTR)a_snapSeeThru);
-        SetWindowPos(h, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        /* opaque picture of a real bar on screen: a bar left in a higher z-band
-           by Start / Task View would show above it, drawn twice */
-        if (!a_snapSeeThru && a_realUnderShown()) tbAlpha(TB_INVISIBLE);
-        waitFrame();
-        return;
-    }
-    ovAlpha(h, 0);
-    SetWindowPos(h, HWND_TOPMOST, x, y, w, hh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    RedrawWindow(h, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-    waitFrame();
-    ovAlpha(h, 255);
-}
-
-/* See-through taskbar (a_tmode): a picture of the bar taken from the screen
-   also holds what is behind its clear background, and sliding it would drag
-   that part of the screen along. matteSnap() turns the picture a_snap shows
-   at (x, y) into one of the bar alone, with per-pixel alpha: the bar (src:
-   the real bar or the cover) is taken twice, over a black and over a white
-   backdrop put right behind it. Meanwhile the (opaque) picture stays on top,
-   excluded from these captures, so none of this is ever seen. */
-typedef BOOL (WINAPI *PFN_SetWindowDisplayAffinity)(HWND, DWORD);
-static PFN_SetWindowDisplayAffinity pSetAffinity;
-#ifndef WDA_EXCLUDEFROMCAPTURE_     /* build with 0 to record what a monitor shows during matteSnap() */
-#define WDA_EXCLUDEFROMCAPTURE_ 0x11
-#endif
-static Surface a_mB, a_mW;
-
-static void surfOpaque(Surface *s)
-{
-    int i, n = s->w * s->h;
-    if (s == &a_snapS) a_snapSeeThru = 0;
-    GdiFlush();
-    if (s->bits) for (i = 0; i < n; i++) s->bits[i] |= 0xFF000000;
-}
-
-static int zBelow(HWND top, HWND h)
-{
-    HWND w;
-    for (w = GetWindow(top, GW_HWNDNEXT); w; w = GetWindow(w, GW_HWNDNEXT))
-        if (w == h) return 1;
-    return 0;
-}
-
-/* the cover with the live thumbnail, right under the opaque picture: only
-   captures see it (the picture is excluded from them). On top of the picture
-   it would be seen, and draw the bar's see-through parts (the Search box) a
-   second time over the picture of them. */
-static int coverUnderSnap(void)
-{
-    thumbOff();
-    if (!pDwmRegThumb || FAILED(pDwmRegThumb(a_cover, g_tb, &a_thumb))) {
-        a_thumb = NULL;
-        return 0;
-    }
-    paintCover();
-    ovAlpha(a_cover, 255);
-    SetPropW(a_cover, SEE_THRU_PROP, (HANDLE)(INT_PTR)a_tmode);
-    SetWindowPos(a_cover, a_snap, g_shown.left, g_shown.top, g_shown.right - g_shown.left,
-                 g_shown.bottom - g_shown.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    RedrawWindow(a_cover, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-    waitFrame();
+    /* right after a frame: both land in the next one. (Urgent, the bar is
+       already out of place: no time to lose.) */
+    if (!urgent) waitFrame();
+    a_thumbFrom = GetTickCount();
+    thumbSet();
+    ovAlpha(255);                      /* first: if timing slips, the bar is drawn twice
+                                          for a moment rather than missing for a moment */
+    tbAlpha(TB_INVISIBLE);
+    a_prep = 0;
+    a_realUnder = 1;
+    a_explSeen = 0;
+    a_carrier = C_COMP;
+    keepOverlayOnTop();
+    DBG(("realToCover urgent=%d t=%lu\r\n", urgent, GetTickCount()));
     return 1;
 }
 
-static void matteSnap(int x, int y, HWND src)
-{
-    int w = a_snapS.w, h = a_snapS.h, i, n, rows, viaCover = 0;
-    if (!pSetAffinity || !a_snapS.bits || !pSetAffinity(a_snap, WDA_EXCLUDEFROMCAPTURE_)) return;
-    /* The real bar is taken through its live thumbnail on the cover: Explorer
-       may start moving the window away meanwhile, which does not move its
-       thumbnail. The bar itself is invisible for this. After Start, Task View
-       or a flyout it can stay in a z-band above all of our windows; it would
-       show above the opaque picture and end up in the captures on top of its
-       thumbnail, its see-through parts (Search) drawn twice in the picture. */
-    if (src == g_tb) {
-        tbAlpha(TB_INVISIBLE);
-        a_thumbFrom = GetTickCount();
-        if (coverUnderSnap()) { src = a_cover; viaCover = 1; }
-    }
-    a_backWhite = 0;
-    SetWindowPos(a_back, zBelow(a_snap, src) ? src : a_snap, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    RedrawWindow(a_back, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-    waitFrame();
-    capture(&a_mB, x, y);
-    a_backWhite = 1;
-    RedrawWindow(a_back, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW);
-    waitFrame();
-    capture(&a_mW, x, y);
-    ShowWindow(a_back, SW_HIDE);
-    pSetAffinity(a_snap, 0);
-    if (viaCover) {
-        ShowWindow(a_cover, SW_HIDE);
-        thumbOff();
-    }
-    GdiFlush();
-    if (!a_mB.bits || !a_mW.bits || a_mB.w != w || a_mB.h != h) return;
-    rows = g_mon.bottom - y;                    /* rows below the screen: nothing */
-    if (rows > h) rows = h;
-    if (rows < 0) rows = 0;
-    n = w * h;
-    for (i = 0; i < n; i++) {
-        DWORD b = a_mB.bits[i], wh = a_mW.bits[i];
-        int bb = b & 255, bg = (b >> 8) & 255, br = (b >> 16) & 255;
-        int d = ((int)(wh & 255) - bb) + ((int)((wh >> 8) & 255) - bg) + ((int)((wh >> 16) & 255) - br);
-        int a = 255 - d / 3;                    /* over black: color * alpha, already premultiplied */
-        if (i >= rows * w) { a_snapS.bits[i] = 0; continue; }
-        if (a < 0) a = 0;
-        if (a > 255) a = 255;
-        if (bb > a) bb = a;
-        if (bg > a) bg = a;
-        if (br > a) br = a;
-        a_snapS.bits[i] = ((DWORD)a << 24) | ((DWORD)br << 16) | ((DWORD)bg << 8) | (DWORD)bb;
-    }
-    a_snapSeeThru = 1;
-}
-
-/* the picture made by matteSnap() replaces the (opaque) one on screen. It is
-   see-through: anything still under it shows, so the caller first takes away
-   the real bar / the cover. (A see-through element of the bar, e.g. the
-   Search box, drawn twice would look brighter for as long as both show.) */
-static void snapReveal(int x, int y)
-{
-    POINT pt, org = { 0, 0 };
-    SIZE sz;
-    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-    HDC sdc = GetDC(NULL);
-    pt.x = x; pt.y = y; sz.cx = a_snapS.w; sz.cy = a_snapS.h;
-    UpdateLayeredWindow(a_snap, sdc, &pt, &sz, a_snapS.dc, &org, 0, &bf, ULW_ALPHA);
-    ReleaseDC(NULL, sdc);
-    SetPropW(a_snap, SEE_THRU_PROP, (HANDLE)(INT_PTR)a_snapSeeThru);
-}
-
-/* See-through bar: hand over from an overlay (picture / cover) to the real
-   bar in one frame. Both on screen would draw the bar's see-through parts
-   twice (they flash brighter); neither would make the bar blink. The bar is
-   still layered here, so its alpha changes at once; its own style comes
-   back afterwards, when nothing shows anymore. */
+/* The cover -> the real bar, within one frame (see realToCover). The bar is
+   still layered here, so its alpha changes at once; its own style comes back
+   afterwards, when nothing shows anymore. */
 static void handToReal(void)
 {
-    DBG(("handToReal start carrier=%d t=%lu\r\n", a_carrier, GetTickCount()));
+    DBG(("handToReal start t=%lu\r\n", GetTickCount()));
     waitFrame();                       /* right after a frame: all land in the next one */
-    tbAlpha(255);                      /* first: if timing slips, the bar is drawn twice
-                                          for a moment rather than missing for a moment */
-    if (a_thumb && pDwmUpdThumb) {
-        THUMBPROPS tp;
-        ZeroMemory(&tp, sizeof tp);
-        tp.dwFlags = TNP_VISIBLE;
-        tp.fVisible = FALSE;
-        pDwmUpdThumb(a_thumb, &tp);
-    }
-    if (IsWindowVisible(a_cover)) ovAlpha(a_cover, 0);
-    if (IsWindowVisible(a_snap)) snapGo();
+    tbAlpha(255);                      /* first: see realToCover */
+    ovAlpha(0);
     waitFrame();
-    hideOverlay();
-    a_snapGoing = 0;
-    DBG(("handToReal swapped t=%lu\r\n", GetTickCount()));
-    waitFrame();
-    tbAlphaRestore();
-    DBG(("handToReal restored t=%lu\r\n", GetTickCount()));
-}
-
-/* real bar (fully shown) -> moving picture of it */
-static void realToSnap(void)
-{
-    int x, y;
-    posAt(a_p, &x, &y);
-    capture(&a_snapS, x, y);
-    a_snapValid = a_p >= 1.0;
-    if (a_tmode) {
-        surfOpaque(&a_snapS);
-        showOverlay(a_snap, x, y, a_snapS.w, a_snapS.h);
-        matteSnap(x, y, g_tb);
-        ShowWindow(g_tb, SW_HIDE);         /* under the still opaque picture */
-        snapReveal(x, y);
-        a_realUnder = 0;
-        a_carrier = C_SNAP;
-        return;
-    }
-    showOverlay(a_snap, x, y, a_snapS.w, a_snapS.h);
-    waitFrame();                       /* picture is on screen before the real one goes */
-    ShowWindow(g_tb, SW_HIDE);
+    coverDown();
     a_realUnder = 0;
-    a_carrier = C_SNAP;
-}
-
-/* cursor left a fully shown bar: freeze a picture of it on top, but leave the
-   real bar shown underneath (click-through picture), so that coming back is
-   instant - a re-shown bar needs a few frames to be redrawn by Explorer */
-static int a_explSeen;           /* Explorer's own hide already reported */
-static void realToSnapHold(void)
-{
-    capture(&a_snapS, g_shown.left, g_shown.top);
-    a_snapValid = 1;
-    if (a_tmode) surfOpaque(&a_snapS);
-    showOverlay(a_snap, g_shown.left, g_shown.top, a_snapS.w, a_snapS.h);
-    if (a_tmode) {
-        /* the picture is see-through: the real bar under it must not show
-           (it would be drawn twice, and Explorer may start sliding it away,
-           which would show as a second taskbar). It is taken away while
-           the opaque picture still covers it. */
-        matteSnap(g_shown.left, g_shown.top, g_tb);
-        if (g_wantLayer) {
-            /* flyout open: already invisible (matteSnap). Explorer will hide
-               the bar by itself; guard() needs it there to see that. */
-            snapReveal(g_shown.left, g_shown.top);
-        } else {
-            /* Explorer starts sliding the bar away by itself and drops a
-               layered style we give it then, so alpha cannot hide it: it
-               goes. Coming back re-shows it under the picture (the
-               a_realUnder = 0 case below), the picture covering the few
-               frames Explorer needs to redraw it. */
-            ShowWindow(g_tb, SW_HIDE);
-            a_realUnder = 0;
-            snapReveal(g_shown.left, g_shown.top);
-        }
+    a_left = 0;
+    a_carrier = C_REAL;
+    if (!g_wantLayer) {
+        waitFrame();
+        tbAlphaRestore();              /* (a taskbar left layered reacts more slowly) */
     }
-    /* With a flyout open (Quick Settings / calendar) the real bar may sit
-       above our picture (higher z-band), and Explorer may start its own
-       30 fps hide: make it invisible so none of that shows. It is already
-       layered then (tbPrelayer), so this is immediate. Without a flyout the
-       picture covers the bar anyway, and changing its style would only make
-       the moving bar flash for a frame or two. */
-    if (g_wantLayer) tbAlpha(TB_INVISIBLE);
-    a_explSeen = 0;
-    a_carrier = C_SNAP;                /* a_realUnder stays 1 */
-}
-
-static int contentShown(void)
-{
-    HWND br = FindWindowExW(g_tb, NULL, L"Windows.UI.Composition.DesktopWindowContentBridge", NULL);
-    return !br || IsWindowVisible(br);
+    DBG(("handToReal done t=%lu\r\n", GetTickCount()));
 }
 
 /* start a slide-in from fully hidden */
 static void startShow(void)
 {
     DBG(("startShow t=%lu\r\n", GetTickCount()));
+    a_hidePending = 0;
+    a_left = 0;
+    a_explSeen = 0;
     if (cfgShowAnimMs <= 0) {
+        coverDown();
         tbAlphaRestore();
         showRealFull();
         a_realUnder = 0;
@@ -1113,20 +910,12 @@ static void startShow(void)
         return;
     }
     /* The real bar can still be on screen here: after Explorer hid it by itself
-       (cursor left while Quick Settings / the calendar was open) its own slow
-       hide animation runs for a while. Make it invisible before taking the
-       background, or the half-hidden bar ends up in the picture and shows up
-       as a second taskbar behind the sliding one. */
-    if (IsWindowVisible(g_tb)) {
-        tbAlpha(TB_INVISIBLE);
-        waitFrame();
-        waitFrame();
-    }
-    capture(&a_coverBg, g_shown.left, g_shown.top);   /* what is behind the bar */
-    copySurface(&a_trueBg, &a_coverBg);
+       its own slow hide animation runs for a while. It must not show. */
+    if (IsWindowVisible(g_tb)) tbAlpha(TB_INVISIBLE);
+    thumbOff();
     a_thumbFrom = GetTickCount();
     a_carrier = C_COMP;
-    if (!coverOn()) {
+    if (!coverUp(1)) {
         /* no thumbnail possible: just show the real bar */
         tbAlphaRestore();
         showRealFull();
@@ -1134,102 +923,64 @@ static void startShow(void)
         a_carrier = C_REAL;
         return;
     }
-    realUnder(1);                      /* hidden under the cover from the first frame */
-}
-
-/* the moving picture reached the top: continue with the cover so the content is
-   live while Explorer finishes showing the real bar */
-static void snapToCover(void)
-{
-    DBG(("snapToCover real=%d thumbIn=%ld t=%lu\r\n", a_realUnder, (LONG)(a_thumbFrom - GetTickCount()), GetTickCount()));
-    capture(&a_coverBg, g_shown.left, g_shown.top);   /* = the picture, fully shown */
-    a_carrier = C_COMP;
-    /* the picture stays under the cover and goes away with it (hideOverlay),
-       so there is never a frame with neither of them on screen */
-    if (!coverOn()) a_carrier = C_SNAP;
-}
-
-/* make dst a copy of src (same size as the bar) */
-static void copySurface(Surface *dst, Surface *src)
-{
-    HDC sdc;
-    if (!src->bmp) return;
-    (void)sdc;
-    if (dst->w != src->w || dst->h != src->h || !dst->bmp) surfAlloc(dst, src->w, src->h);
-    BitBlt(dst->dc, 0, 0, src->w, src->h, src->dc, 0, 0, SRCCOPY);
-}
-
-/* A hide was reversed half-way: the moving picture may only be partly valid
-   (what was off screen when it was taken is black), so continue with the
-   cover and the live thumbnail instead of sliding the picture back up.
-   Background: what is on screen above the picture now, plus the last known
-   background behind the bar. */
-static void snapToCoverPartial(void)
-{
-    int x, y, rows;
-    int w = g_shown.right - g_shown.left, h = g_shown.bottom - g_shown.top;
-    posAt(a_p, &x, &y);
-    rows = y - g_shown.top;
-    if (rows < 0) rows = 0;
-    if (rows > h) rows = h;
-    a_thumbFrom = GetTickCount();
-    if (a_trueBg.bmp && a_trueBg.w == w && a_trueBg.h == h) {
-        HDC sdc = GetDC(NULL);
-        copySurface(&a_coverBg, &a_trueBg);
-        if (rows > 0)
-            BitBlt(a_coverBg.dc, 0, 0, w, rows, sdc, g_shown.left, g_shown.top, SRCCOPY);
-        ReleaseDC(NULL, sdc);
-    } else {
-        capture(&a_coverBg, g_shown.left, g_shown.top);
-    }
-    a_carrier = C_COMP;
-    if (coverOn()) {
-        if (a_tmode) {
-            snapGo();                  /* never both: see snapGo() */
-        } else {
-            waitFrame();
-            ShowWindow(a_snap, SW_HIDE);
-        }
-    } else {
-        a_carrier = C_SNAP;
-    }
+    a_prep = 0;
+    realUnder();                       /* invisible under the cover from the first frame */
 }
 
 /* Explorer restarted its own unhide on a bar we consider shown (it jumped to
-   its hidden spot): hide that under the cover until it is back */
+   its hidden spot): the cover shows the bar in its place until it is back */
 static void maskNativeUnhide(void)
 {
-    /* invisible first: Explorer's own slide must not show (tests: qs-rapid) */
-    tbAlpha(TB_INVISIBLE);
-    a_thumbFrom = GetTickCount();
-    capture(&a_coverBg, g_shown.left, g_shown.top);
-    a_carrier = C_COMP;
-    a_realUnder = 1;
-    a_explSeen = 0;                    /* see guard(): the cursor may leave meanwhile */
+    if (!realToCover(1)) return;
     a_showStart = GetTickCount();
     a_revealAt = a_showStart + REVEAL_MS;
-    if (!coverOn()) a_carrier = C_REAL;
 }
 
-/* slide-in reversed half-way: freeze what the cover shows into the moving picture */
-static void compToSnap(void)
+/* The pin (FastBarTap.dll, see tapPin) keeps the real bar in place while the
+   cursor is away and during the slide out, and also refuses to hide it. */
+#define TAP_CLASS   L"FastBarTapWnd"
+#define TAP_MSG_SET (WM_APP + 1)
+#define TAP_MSG_PIN (WM_APP + 2)
+static void tapUnpinNow(void)
 {
-    int x, y;
-    posAt(a_p, &x, &y);
-    capture(&a_snapS, x, y);           /* the cover (live bar) is what is on screen */
-    a_snapValid = a_p >= 1.0;
-    if (a_tmode) surfOpaque(&a_snapS);
-    showOverlay(a_snap, x, y, a_snapS.w, a_snapS.h);
-    if (a_tmode) matteSnap(x, y, a_cover);
-    ShowWindow(a_cover, SW_HIDE);
-    thumbOff();
-    realUnder(0);
-    if (a_tmode) snapReveal(x, y);
-    a_carrier = C_SNAP;
+    HWND w;
+    DWORD_PTR res;
+    int ok = 0;
+    for (w = FindWindowExW(HWND_MESSAGE, NULL, TAP_CLASS, NULL); w;
+         w = FindWindowExW(HWND_MESSAGE, w, TAP_CLASS, NULL))
+        ok |= SendMessageTimeoutW(w, TAP_MSG_PIN, 0, 0, SMTO_ABORTIFHUNG, 60, &res) != 0;
+    if (ok) InterlockedExchange(&g_tapPinned, 0);
 }
 
-/* a window went full screen over the shown bar: no slide, a picture taken from
-   the screen would show (and drag along) that window */
+/* The real bar goes off screen. Explorer can be busy for a while (in the
+   middle of a hide of its own): then the pin is still on and refuses, and the
+   bar stays invisible until guard() gets it hidden (a_hidePending). */
+static int hideReal(void)
+{
+    if (!g_tb || !IsWindowVisible(g_tb)) return 1;
+    tapUnpinNow();                     /* (whatever g_tapPinned says: the main thread
+                                          may have posted a pin that is still on its way) */
+    ShowWindow(g_tb, SW_HIDE);
+    return !IsWindowVisible(g_tb);
+}
+
+/* the slide out is over (or there is none) */
+static void finishHide(void)
+{
+    int i, gone = 0;
+    coverDown();
+    /* (the cursor is back meanwhile: the bar comes up again right away) */
+    for (i = 0; i < 4 && g_desired == D_HIDDEN && !(gone = hideReal()); i++) waitFrame();
+    if (gone) tbAlphaRestore();
+    else tbAlpha(TB_INVISIBLE);
+    a_hidePending = !gone;
+    a_realUnder = 0;
+    a_p = 0.0;
+    a_carrier = C_NONE;
+    DBG(("finishHide gone=%d t=%lu\r\n", gone, GetTickCount()));
+}
+
+/* a window went full screen over the shown bar: no slide */
 static volatile LONG g_hideNow;
 /* new geometry while the bar is up: put the real bar at its new spot (guard) */
 static volatile LONG g_replace;
@@ -1245,94 +996,68 @@ static void animate(void)
         double target, dt;
         if (g_paused) return;
 
-        if (a_carrier == C_NONE || a_carrier == C_REAL) {
-            a_tmode = cfgTransparent;           /* see a_tmode */
-            a_snap = a_tmode ? a_snapT : a_snapO;
-        }
         if (d == D_HIDDEN) {
             target = 0.0;
-            if (InterlockedExchange(&g_hideNow, 0) && a_carrier != C_NONE) {
-                hideOverlay();
-                a_snapGoing = 0;
-                ShowWindow(g_tb, SW_HIDE);
-                tbAlphaRestore();
-                a_realUnder = 0;
-                a_p = 0.0;
-                a_carrier = C_NONE;
-            }
-            if (a_carrier == C_REAL) realToSnap();
-            else if (a_carrier == C_COMP) compToSnap();
-            else realUnder(0);
+            if (InterlockedExchange(&g_hideNow, 0) && a_carrier != C_NONE) finishHide();
+            if (a_carrier != C_NONE) a_left = 1;
+            /* the real bar is taken over by the cover, which then slides */
+            if (a_carrier == C_REAL && (cfgHideAnimMs <= 0 || !realToCover(0))) finishHide();
         } else {
             target = 1.0;
             if (a_carrier == C_NONE) startShow();
-            if (a_carrier == C_SNAP && a_p < 1.0 && !a_snapValid) {
-                /* hide reversed, picture only partly valid: go on live */
-                snapToCoverPartial();
-                realUnder(1);
-            }
             if (d == D_HOLD) {
-                /* cursor left: a fully shown bar is frozen into a picture;
-                   a slide-in in progress just finishes */
-                if (a_carrier == C_REAL) realToSnapHold();
-                else if (a_carrier == C_COMP) realUnder(1);
-                else if (a_carrier == C_SNAP && a_p >= 1.0 && !a_realUnder && g_wantLayer) {
-                    /* a hide reversed, the picture is back up, but a flyout
-                       keeps the bar up while the cursor is away. Only Explorer
-                       hiding the bar by itself ends that (guard), and it can
-                       only do so if the bar is there: put the real bar under
-                       the picture, invisible, as realToSnapHold() leaves it */
-                    realUnder(1);
-                    a_explSeen = 0;
+                /* cursor left: the bar stays as it is, live; a slide-in just
+                   finishes. Pinned (it waits to go, see tapPin) the real bar
+                   stays and gets ready for the slide out. Not pinned (a flyout
+                   keeps it up, or FastBarTap.dll is missing) Explorer will
+                   hide it by itself at some point, and the first step of that
+                   would show: the cover takes over now, the pin goes, and
+                   Explorer then moves an invisible bar (guard). */
+                a_left = 1;
+                if (a_carrier == C_REAL) {
+                    DBG(("hold: real bar pin=%ld/%ld full=%d prep=%d t=%lu\r\n", g_holdPinned, g_tapPinned,
+                         realAtFull(), a_prep, GetTickCount()));
+                    if (g_holdPinned && g_tapPinned == 1) { if (!a_prep) coverPrep(); }
+                    else if (realAtFull()) realToCover(0);
                 }
-            } else if (a_carrier == C_SNAP && a_p >= 1.0) {
-                if (a_realUnder && realAtFull() && contentShown()) {
-                    /* came back while the real bar is still in place: drop the picture */
-                    barRaise();
-                    if (a_tmode) {
-                        handToReal();
-                    } else {
-                        tbAlphaRestore();
-                        waitFrame();               /* real bar opaque before the picture goes */
-                        ShowWindow(a_snap, SW_HIDE);
-                    }
-                    a_carrier = C_REAL;
-                } else {
-                    /* the real bar has to be (re)shown: keep the picture until
-                       Explorer has redrawn it, then go live */
-                    if (a_realUnder && !realAtFull()) a_realUnder = 0;
-                    /* set before the cover appears: its thumbnail must stay
-                       hidden until the re-shown bar has been redrawn */
-                    a_thumbFrom = GetTickCount() + (a_realUnder ? 0 : REDRAW_MS);
-                    snapToCover();
-                    realUnder(1);
+                if (!g_holdPinned && g_tapPinned == 1 && g_desired == D_HOLD) tapUnpinNow();
+            } else {
+                if (a_left) {
+                    /* the cursor is back. Explorer may have tried to hide the
+                       bar meanwhile, and take it for hidden. */
+                    a_left = 0;
+                    if (a_carrier == C_COMP || !realAtFull() || !contentShown()) showRealFull();
+                    DBG(("back: carrier=%d full=%d content=%d explSeen=%d t=%lu\r\n", a_carrier, realAtFull(),
+                         contentShown(), a_explSeen, GetTickCount()));
+                    /* (with a flyout open, only if Explorer did: the message
+                       is not needed otherwise) */
+                    if (!g_wantLayer || a_explSeen) syncExplorerShown();
+                    a_showStart = GetTickCount();
+                    a_revealAt = a_showStart + REVEAL_MS;
                 }
-            } else if (a_carrier == C_COMP) {
-                realUnder(1);
+                if (a_carrier == C_REAL && a_prep && !g_wantLayer) {
+                    coverDown();
+                    tbAlphaRestore();
+                }
             }
         }
 
         if (a_p == target) {
             if (target == 0.0 && a_carrier != C_NONE) {
-                hideOverlay();
-                ShowWindow(g_tb, SW_HIDE);
-                a_realUnder = 0;
-                a_carrier = C_NONE;
-            } else if (target == 1.0 && d == D_SHOWN && a_carrier != C_REAL && a_realUnder) {
+                if (g_desired != d) continue;      /* turned around at the last moment */
+                finishHide();
+            } else if (target == 1.0 && d == D_SHOWN && a_carrier == C_COMP) {
                 if (realReady()) {
                     /* real bar is ready: opaque again, and its original window
-                       style back (a taskbar left layered reacts more slowly) */
+                       style back. (The shield first: barRaise must see what
+                       is really over the bar's place.) */
+                    shieldOff();
                     barRaise();
-                    if (a_tmode) {
-                        handToReal();
-                    } else {
-                        tbAlphaRestore();
-                        waitFrame();
-                        hideOverlay();
-                    }
-                    a_carrier = C_REAL;
+                    handToReal();
                 } else {
-                    if (a_carrier == C_COMP) paintCover();
+                    shieldCheck();
+                    thumbSet();
+                    keepUnder();
                     keepOverlayOnTop();
                     waitFrame();
                     pumpMessages();
@@ -1357,143 +1082,112 @@ static void animate(void)
             if (a_p < 0.0) a_p = 0.0;
         }
 
-        if (a_carrier == C_SNAP) placeSnap(a_p);
-        else if (a_carrier == C_COMP) paintCover();
+        if (a_carrier == C_COMP) {
+            thumbSet();
+            keepUnder();
+        }
         keepOverlayOnTop();
         waitFrame();
         pumpMessages();
     }
 }
 
-/* Picture of the fully shown bar, taken when the cursor leaves it while the
-   bar stays up (e.g. Quick Settings / the calendar is open). If Explorer then
-   starts hiding the bar by itself, this picture lets FastBar play its own
-   hide (hide delay + smooth slide) instead of Explorer's fast 30 fps one. */
-static Surface a_precap;
-static DWORD   a_precapAt;
-static int     a_precapOk;
-static volatile LONG g_precapReq;
-#define PRECAP_MAX_AGE_MS 2000
-
-static void precapture(void)
-{
-    if (a_carrier == C_REAL && a_p >= 1.0 && realAtFull() && contentShown() && a_tmode) {
-        /* see-through bar: a picture of the bar alone (matteSnap), taken
-           under a still picture that stands over the bar for a few frames */
-        capture(&a_snapS, g_shown.left, g_shown.top);
-        surfOpaque(&a_snapS);
-        showOverlay(a_snap, g_shown.left, g_shown.top, a_snapS.w, a_snapS.h);
-        /* The bar is invisible meanwhile (the opaque picture looks the same),
-           and comes back in the frame the picture goes - unless Explorer
-           moved it: guard() takes over then */
-        matteSnap(g_shown.left, g_shown.top, g_tb);
-        if (realAtFull()) {
-            waitFrame();
-            tbAlpha(255);
-        }
-        ShowWindow(a_snap, SW_HIDE);
-        copySurface(&a_precap, &a_snapS);
-        a_precapAt = GetTickCount();
-        a_precapOk = 1;
-    } else if (a_carrier == C_REAL && a_p >= 1.0 && realAtFull() && contentShown()) {
-        capture(&a_precap, g_shown.left, g_shown.top);
-        a_precapAt = GetTickCount();
-        a_precapOk = 1;
-        DBG(("precap ok t=%lu\r\n", a_precapAt));
-    } else {
-        DBG(("precap skip carrier=%d full=%d content=%d\r\n", a_carrier, realAtFull(), contentShown()));
-    }
-}
-
 /* keep things consistent if Explorer moves/shows the taskbar on its own */
 static void guard(void)
 {
+    LONG d = g_desired;
+    RECT r;
     if (g_paused || !g_tb) return;
-    if (a_carrier == C_NONE && g_desired == D_HIDDEN) {
+    if (a_carrier == C_NONE && d == D_HIDDEN) {
         /* let Explorer finish its own hide animation before hiding the window */
-        if (IsWindowVisible(g_tb) && (LONG)(GetTickCount() - a_explorerHideUntil) >= 0)
+        if (a_hidePending) {
+            if (hideReal()) {
+                DBG(("guard: bar hidden at last t=%lu\r\n", GetTickCount()));
+                tbAlphaRestore();
+                a_hidePending = 0;
+            }
+        } else if (IsWindowVisible(g_tb) && (LONG)(GetTickCount() - a_explorerHideUntil) >= 0) {
             ShowWindow(g_tb, SW_HIDE);
-    } else if ((a_carrier == C_SNAP || a_carrier == C_COMP) && a_realUnder &&
-               g_desired == D_HOLD && !a_explSeen) {
-        /* bar frozen into a picture (cursor away, flyout open), or still under
-           the cover (maskNativeUnhide) when the cursor went away: if Explorer
-           hides / has hidden the (invisible) real bar, tell the main thread,
-           which then hides the bar the normal FastBar way */
-        RECT r;
+        }
+    } else if (a_carrier == C_COMP && a_realUnder && d != D_HIDDEN) {
+        /* the cover is up with the cursor away (a slide-in that finished after
+           the cursor left, or a bar taken over below). Explorer hides the
+           (invisible) real bar by itself: with a flyout open that is what ends
+           the wait, so tell the main thread, which then hides the bar the
+           normal FastBar way. (Not while it waits to go or a menu keeps it
+           up, g_holdPinned: without FastBarTap.dll nothing stops Explorer
+           then.) The bar stays in place for its clicks. */
+        keepUnder();
         if (IsWindowVisible(g_tb) && GetWindowRect(g_tb, &r) &&
             (r.left - g_shown.left) * g_offX + (r.top - g_shown.top) * g_offY > 0) {
-            a_explSeen = 1;
-            DBG(("guard: explorer hides frozen bar t=%lu\r\n", GetTickCount()));
-            /* Without a flyout the real bar is still opaque, and Explorer keeps
-               it above our picture: its own 30 fps slide would show as a second
-               taskbar. The picture already shows the bar where it was, so take
-               the real one off screen now (with a flyout it is invisible). */
-            if (!g_wantLayer && a_carrier == C_SNAP) {
-                ShowWindow(g_tb, SW_HIDE);
-                a_realUnder = 0;
+            if (d == D_HOLD && !a_explSeen && !g_holdPinned) {
+                a_explSeen = 1;
+                DBG(("guard: explorer hides the bar under the cover t=%lu\r\n", GetTickCount()));
+                PostMessageW(g_hwnd, WM_APP_EXPLHID, 1, 0);
             }
-            PostMessageW(g_hwnd, WM_APP_EXPLHID, 1, 0);
+            if (d == D_HOLD) placeReal(1.0);
         }
-    } else if (a_carrier == C_REAL && a_p >= 1.0 && g_desired == D_SHOWN) {
-        RECT r;
+    } else if (a_carrier == C_REAL && a_p >= 1.0 && d != D_HIDDEN) {
         if (InterlockedExchange(&g_replace, 0) && IsWindowVisible(g_tb)) {
             placeReal(1.0);
             showContent();
         }
         if (realAtFull()) barRaise();
-        /* (see-through: a bar Explorer is moving away stays invisible, see
-           precapture(); it is dealt with below) */
-        if (g_wantLayer) { if (!a_tmode || realAtFull()) tbPrelayer(); }
-        else tbAlphaRestore();
+        /* cursor away (D_HOLD) or a flyout open: ready for a quick takeover */
+        if (g_wantLayer || d == D_HOLD) {
+            if (realAtFull()) coverPrep();
+        } else {
+            if (a_prep) coverDown();
+            tbAlphaRestore();
+        }
         if (!IsWindowVisible(g_tb)) showRealFull();
         else if (GetWindowRect(g_tb, &r) && (r.left != g_shown.left || r.top != g_shown.top)) {
             long dx = r.left - g_shown.left, dy = r.top - g_shown.top;
             long along = dx * g_offX + dy * g_offY;          /* > 0: towards hidden */
             long full = g_offX * g_offX + g_offY * g_offY;
-            DBG(("guard moved dx=%ld dy=%ld along=%ld full=%ld precap=%d age=%lu t=%lu\r\n", dx, dy, along, full,
-                 a_precapOk, GetTickCount() - a_precapAt, GetTickCount()));
             POINT pt;
+            DBG(("guard moved dx=%ld dy=%ld along=%ld full=%ld d=%ld prep=%d t=%lu\r\n", dx, dy, along, full,
+                 d, a_prep, GetTickCount()));
             GetCursorPos(&pt);
             if (along > 0 && g_wantLayer && cursorOnBar(pt) && fullscreenBehind()) {
                 /* A tray flyout opened from Start over a window Windows takes
                    for full screen (Riot Client): Explorer pulls the bar to its
                    hidden spot under the cursor, past the pin, and does not
-                   bring it back. Put it back at once: covering it would show
-                   the drop, and then a picture where the live bar should be. */
+                   bring it back. Put it back at once. */
                 DBG(("guard: bar pulled away with a flyout open, put back t=%lu\r\n", GetTickCount()));
+                /* It also drops the bar below that window, and stays busy for
+                   ~250 ms: putting the bar back and raising it wait for
+                   Explorer, and meanwhile the bar would be gone (a see-through
+                   bar seems to lose its icons). The cover shows it in place
+                   from the next frame on, until the real one is back on top
+                   (animate: realReady, barRaise, handToReal). */
+                maskNativeUnhide();
+                if (a_carrier == C_COMP) shieldOn();   /* before anything that waits for Explorer */
                 placeReal(1.0);
                 showContent();
-            } else if (along * 4 >= full * 3 || (along > 0 && cursorOnBar(pt))) {
+                SetEvent(g_evt);
+            } else if (d == D_SHOWN && (along * 4 >= full * 3 || (along > 0 && cursorOnBar(pt)))) {
                 /* jumped (almost) all the way: Explorer restarts its own unhide.
                    Or Explorer started its own hide just as the cursor came back
                    onto the bar: it brings the bar back by itself. Either way,
-                   cover it until it is back in place. */
+                   the cover shows it in place until it is back. */
                 maskNativeUnhide();
                 SetEvent(g_evt);
-            } else if (along > 0 && a_precapOk &&
-                       GetTickCount() - a_precapAt < PRECAP_MAX_AGE_MS &&
-                       a_precap.w == g_shown.right - g_shown.left &&
-                       a_precap.h == g_shown.bottom - g_shown.top) {
-                /* Explorer started hiding the bar by itself: cover it with the
-                   picture taken while it was still fully shown, make the real
-                   bar invisible, and hide it the normal FastBar way */
-                a_precapOk = 0;
-                copySurface(&a_snapS, &a_precap);
-                a_snapSeeThru = a_tmode;       /* precapture() made it with matteSnap() */
-                a_snapValid = 1;
-                showOverlay(a_snap, g_shown.left, g_shown.top, a_snapS.w, a_snapS.h);
-                tbAlpha(TB_INVISIBLE);
-                a_realUnder = 0;
-                a_carrier = C_SNAP;
+            } else if (along > 0 && realToCover(1)) {
+                /* Explorer started hiding the bar by itself (the cursor is away;
+                   e.g. it went into Quick Settings / the calendar): the cover
+                   takes the bar over where it stood, live, the real one goes
+                   back to its place under it, and the bar is then hidden the
+                   normal FastBar way */
+                placeReal(1.0);
+                showContent();
                 a_p = 1.0;
+                a_explSeen = 1;
                 a_explorerHideUntil = GetTickCount() + 600;
                 InterlockedExchange(&g_desired, D_HOLD);
                 PostMessageW(g_hwnd, WM_APP_EXPLHID, 1, 0);
             } else if (along > 0) {
-                /* Explorer is hiding the bar by itself (e.g. the cursor went into
-                   Quick Settings / the calendar). Its content is already sliding
-                   away, so putting the window back would leave an invisible bar
-                   that still eats clicks: go along with it instead. */
+                /* no cover possible: go along with Explorer's own hide */
                 a_carrier = C_NONE;
                 a_p = 0.0;
                 a_explorerHideUntil = GetTickCount() + 600;
@@ -1506,25 +1200,17 @@ static void guard(void)
     }
 }
 
-static LRESULT CALLBACK SnapProc(HWND h, UINT m, WPARAM w, LPARAM l)
+static LRESULT CALLBACK CoverProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_PAINT: {
+        /* all of it is the color key: only the live thumbnail shows, drawn
+           on top by DWM */
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
-        if (h == a_back) {
-            FillRect(dc, &ps.rcPaint, (HBRUSH)GetStockObject(a_backWhite ? WHITE_BRUSH : BLACK_BRUSH));
-        } else if (h == a_cover && a_tmode) {
-            /* see-through: the color key leaves only the live thumbnail */
-            HBRUSH b = CreateSolidBrush(COVER_KEY);
-            FillRect(dc, &ps.rcPaint, b);
-            DeleteObject(b);
-        } else if (h == a_cover) {
-            /* background; the live thumbnail of the bar is drawn on top by DWM */
-            if (a_coverBg.dc) BitBlt(dc, 0, 0, a_coverBg.w, a_coverBg.h, a_coverBg.dc, 0, 0, SRCCOPY);
-        } else if (a_snapS.dc) {
-            BitBlt(dc, 0, 0, a_snapS.w, a_snapS.h, a_snapS.dc, 0, 0, SRCCOPY);
-        }
+        HBRUSH b = CreateSolidBrush(COVER_KEY);
+        FillRect(dc, &ps.rcPaint, b);
+        DeleteObject(b);
         EndPaint(h, &ps);
         return 0;
     }
@@ -1534,47 +1220,46 @@ static LRESULT CALLBACK SnapProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
+/* see shieldOn: takes the mouse and does nothing with it */
+static LRESULT CALLBACK ShieldProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_MOUSEACTIVATE) return MA_NOACTIVATEANDEAT;
+    return DefWindowProcW(h, m, w, l);
+}
+
 static DWORD WINAPI AnimThread(LPVOID unused)
 {
     WNDCLASSW wc = { 0 };
     (void)unused;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    wc.lpfnWndProc = SnapProc;
+    wc.lpfnWndProc = CoverProc;
     wc.hInstance = GetModuleHandleW(NULL);
-    wc.lpszClassName = L"FastBarSnapshot";
+    wc.lpszClassName = L"FastBarOverlay";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassW(&wc);
-    /* both overlays are click-through (layered + transparent): the mouse goes
-       to the real bar underneath, which is what makes Explorer draw it */
-    pSetAffinity = (PFN_SetWindowDisplayAffinity)GetProcAddress(GetModuleHandleW(L"user32.dll"),
-                                                                "SetWindowDisplayAffinity");
-    a_snapT = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
-                              WS_EX_LAYERED | WS_EX_TRANSPARENT,
-                              wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
-                              NULL, NULL, wc.hInstance, NULL);
-    a_back = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
-                             WS_EX_LAYERED | WS_EX_TRANSPARENT,
-                             wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
-                             NULL, NULL, wc.hInstance, NULL);
-    SetLayeredWindowAttributes(a_back, 0, 255, LWA_ALPHA);
-    a_snapO = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
-                              WS_EX_LAYERED | WS_EX_TRANSPARENT,
-                              wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
-                              NULL, NULL, wc.hInstance, NULL);
-    SetLayeredWindowAttributes(a_snapO, 0, 255, LWA_ALPHA);
-    a_snap = a_snapO;
+    /* click-through (layered + transparent): the mouse goes to the real bar
+       underneath, which is what makes Explorer draw it */
     a_cover = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
                               WS_EX_LAYERED | WS_EX_TRANSPARENT,
                               wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1,
                               NULL, NULL, wc.hInstance, NULL);
-    SetLayeredWindowAttributes(a_cover, 0, 255, LWA_ALPHA);
+    ovAlpha(255);
+    wc.lpfnWndProc = ShieldProc;
+    wc.lpszClassName = L"FastBarShield";
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    RegisterClassW(&wc);
+    a_shield = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                               wc.lpszClassName, L"", WS_POPUP, 0, 0, 1, 1, NULL, NULL, wc.hInstance, NULL);
+    if (a_shield) SetLayeredWindowAttributes(a_shield, 0, 1, LWA_ALPHA);
     for (;;) {
-        DWORD r = MsgWaitForMultipleObjects(1, &g_evt, FALSE, INFINITE, QS_ALLINPUT);
+        int shield = a_shield && IsWindowVisible(a_shield);
+        DWORD r = MsgWaitForMultipleObjects(1, &g_evt, FALSE, shield ? 50 : a_hidePending ? 30 : INFINITE,
+                                            QS_ALLINPUT);
         pumpMessages();
-        if (r == WAIT_OBJECT_0) {
+        if (shield) shieldCheck();
+        if (r == WAIT_OBJECT_0 || (r == WAIT_TIMEOUT && a_hidePending)) {
             InterlockedExchange(&g_animIdle, 0);
             animate();
-            if (InterlockedExchange(&g_precapReq, 0)) precapture();
             guard();
             InterlockedExchange(&g_animIdle, 1);
         }
@@ -1596,10 +1281,10 @@ static void restoreTaskbar(void)
     InterlockedExchange(&g_paused, 1);
     SetEvent(g_evt);
     for (i = 0; i < 100 && !g_animIdle; i++) Sleep(5);
-    if (a_snapO) ShowWindow(a_snapO, SW_HIDE);
-    if (a_snapT) ShowWindow(a_snapT, SW_HIDE);
     if (a_cover) ShowWindow(a_cover, SW_HIDE);
     thumbOff();
+    a_prep = 0;
+    a_hidePending = 0;
     if (g_tb) {
         a_p = 1.0;
         a_realUnder = 0;
@@ -1622,10 +1307,10 @@ static int cursorInside(POINT pt)
     if (PtInRect(&r, pt) || atEdge(pt)) return 1;
     if (g_dragInside && (GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return 1;
     under = WindowFromPoint(pt);
-    if (under && under != a_snap) {
+    if (under && under != a_cover) {
         HWND root = GetAncestor(under, GA_ROOT);
         static const WCHAR *const cw[] = { L"Windows.UI.Core.CoreWindow", NULL };
-        if (root != a_snap && classIs(root, kPopupClasses) && !isCloaked(root) &&
+        if (root != a_cover && classIs(root, kPopupClasses) && !isCloaked(root) &&
             /* Start/search linger while closing: only count them while active */
             (!classIs(root, cw) || root == GetForegroundWindow()))
             return 1;
@@ -1649,7 +1334,8 @@ static int g_explHid;
 static int g_onBar;
 static DWORD g_leaveAt;     /* when the cursor last left the bar */
 /* the cursor is away but an open flyout (Quick Settings, calendar, jump list...)
-   keeps the bar up: it is frozen into a picture (D_HOLD) while in M_SHOWN */
+   keeps the bar up (D_HOLD while in M_SHOWN; the name is from when the bar was
+   frozen into a picture for this: it stays live now) */
 static int g_frozen;
 /* Win+T / Win+B: the keyboard focus went to the hidden bar (the foreground
    switched to it while it was hidden). Explorer would unhide it; FastBar shows
@@ -1734,6 +1420,7 @@ static void showNow(void)
     g_mode = M_SHOWN;
     g_frozen = 0;
     g_explHid = 0;
+    tapPin(1);                      /* from the start: see keepUnder() */
     setDesired(D_SHOWN);
 }
 
@@ -1801,7 +1488,21 @@ static void evaluate(void)
     updatePolling(fg);
     /* the cursor is on the shown bar: Explorer must not hide it (tap.c) */
     if (g_kbFocus && !classIs(fg, kTrayClasses)) g_kbFocus = 0;   /* focus went elsewhere */
-    tapPin(g_mode == M_SHOWN && (cursorOnBar(pt) || g_kbFocus));
+    /* ... nor while the cursor is away and the bar waits to go, nor during
+       the slide out: the real bar stays in place for its live thumbnail */
+    if (g_mode != M_SHOWN) {
+        tapPin(g_mode == M_LEAVING || a_carrier != C_NONE);
+    } else if (cursorOnBar(pt) || g_kbFocus || !wantShown(pt, fg)) {
+        tapPin(1);                  /* on the bar, or about to wait and go */
+    } else if (cursorInside(pt)) {
+        tapPin(0);                  /* on one of the bar's popups */
+    } else if (!fgKeeps(fg)) {
+        tapPin(1);                  /* cursor away, a menu keeps the bar up */
+    }
+    /* else the cursor is away and a flyout keeps the bar up, until Explorer
+       hides it by itself (D_HOLD below). The anim thread lets the bar go, once
+       the cover has it: a move Explorer still had in store lands the moment
+       the pin goes, and must not show. */
     DBG(("eval pt=%ld,%ld mode=%d mon=%ld,%ld,%ld,%ld edge=%d at=%d full=%d t=%lu\r\n", pt.x, pt.y, g_mode,
          g_mon.left, g_mon.top, g_mon.right, g_mon.bottom, g_edge, atEdge(pt), fgIsFullscreen(),
          GetTickCount()));
@@ -1858,23 +1559,13 @@ static void evaluate(void)
     }
 #endif
     if (g_mode == M_SHOWN) {
-        /* cursor just left the bar: keep a picture of it, in case Explorer
-           starts hiding it by itself (see guard) */
         int on = cursorOnBar(pt);
         if (g_desired == D_SHOWN && barCovered()) SetEvent(g_evt);   /* guard raises it */
-        if (!on && g_onBar) {
-            g_leaveAt = GetTickCount();
-            /* (see-through: the picture takes a few frames; without a flyout
-               the bar goes to D_HOLD right below, which takes its own) */
-            if (!cfgTransparent || fgKeeps(fg)) {
-                InterlockedExchange(&g_precapReq, 1);
-                SetEvent(g_evt);
-            }
-        }
+        if (!on && g_onBar) g_leaveAt = GetTickCount();
         g_onBar = on;
     }
     {
-        /* a flyout is open: prepare the bar for a quick freeze (tbPrelayer) */
+        /* a flyout is open: get the bar ready for a quick takeover (coverPrep) */
         LONG wl = g_mode == M_SHOWN && fgKeeps(fg);
         if (wl != g_wantLayer) {
             InterlockedExchange(&g_wantLayer, wl);
@@ -1890,17 +1581,21 @@ static void evaluate(void)
             g_onBar = cursorOnBar(pt);
             setDesired(D_SHOWN);
         } else {
-            /* kept up only by an open flyout, cursor elsewhere: freeze the
-               bar into a picture; live again once the cursor is back */
-            int frz = !cursorInside(pt) && !g_kbFocus;   /* (keyboard: stays live) */
-            if (frz != g_frozen) {
+            /* kept up only by an open flyout, cursor elsewhere (D_HOLD): the
+               bar stays live, until Explorer hides it by itself (guard) */
+            int frz = !cursorInside(pt) && !g_kbFocus;
+            LONG hp = !fgKeeps(fg);                      /* a menu: the bar stays for sure */
+            if (frz != g_frozen || (frz && hp != g_holdPinned)) {
                 g_frozen = frz;
+                InterlockedExchange(&g_holdPinned, hp);
                 setDesired(frz ? D_HOLD : D_SHOWN);
             }
         }
     } else if (g_mode == M_SHOWN) {
         g_frozen = 0;
         g_mode = M_LEAVING;
+        InterlockedExchange(&g_holdPinned, 1);
+        tapPin(1);                  /* the bar stays in place until it has slid out */
         if (cfgHideDelay <= 0) { g_mode = M_HIDDEN; setDesired(D_HIDDEN); }
         else { setDesired(D_HOLD); SetTimer(g_hwnd, TIMER_HIDE, cfgHideDelay, NULL); }
     }
@@ -1956,6 +1651,8 @@ static void CALLBACK WinEventProc(HWINEVENTHOOK hk, DWORD ev, HWND h, LONG obj, 
         /* a menu (or another popup of Explorer) closed: may the bar go now?
            (see barMenuOpen; the cursor may be resting away from the bar) */
         if (g_mode != M_HIDDEN) PostMessageW(g_hwnd, WM_APP_EVAL, 0, 0);
+        /* the bar's content was hidden under the cover: guard shows it again */
+        if (ev == EVENT_OBJECT_HIDE && !g_paused && g_animIdle && GetParent(h) == g_tb) SetEvent(g_evt);
         return;
     }
     if (ev == EVENT_SYSTEM_FOREGROUND) {
@@ -2038,7 +1735,6 @@ static void engage(void)
     g_mode = M_HIDDEN;
     g_explHid = 0;
     g_frozen = 0;
-    a_precapOk = 0;
     InterlockedExchange(&g_desired, D_HIDDEN);
     InterlockedExchange(&g_paused, 0);
     iniSetInt(L"Running", 1);
@@ -2057,22 +1753,21 @@ static void engage(void)
    FastBarTap.dll (64-bit) is loaded into Explorer by 64-bit rundll32 and
    makes the taskbar's XAML background clear (see tap.c). Once it is there,
    it is switched with messages to its windows. */
-#define TAP_CLASS   L"FastBarTapWnd"
-#define TAP_MSG_SET (WM_APP + 1)
 static HANDLE g_tapProc;            /* rundll32 loading the DLL */
 
-#define TAP_MSG_PIN (WM_APP + 2)
-static int g_tapPinned = -1;         /* what the DLL was told last; -1: not told yet */
 static void tapPin(int on)
 {
     HWND w;
     int n = 0;
     if (on == g_tapPinned) return;
+#ifdef FB_NOPIN                      /* tests: as if FastBarTap.dll were missing */
+    return;
+#endif
     for (w = FindWindowExW(HWND_MESSAGE, NULL, TAP_CLASS, NULL); w;
          w = FindWindowExW(HWND_MESSAGE, w, TAP_CLASS, NULL), n++)
         PostMessageW(w, TAP_MSG_PIN, on, 0);
     DBG(("tapPin %d windows=%d t=%lu\r\n", on, n, GetTickCount()));
-    if (n) g_tapPinned = on;         /* DLL not there (yet): try again next time */
+    if (n) InterlockedExchange(&g_tapPinned, on);   /* DLL not there (yet): try again next time */
 }
 
 static int tapSend(int on)
@@ -2261,7 +1956,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_APP_EXPLHID:          /* Explorer hid the bar on its own */
         DBG(("explhid w=%d mode=%d t=%lu\r\n", (int)w, g_mode, GetTickCount()));
         if (w) {
-            /* the bar is covered by its picture (frozen, or taken over by
+            /* the cover shows the bar (cursor away with a flyout open, or taken over by
                guard): hide it the normal way, the hide delay counted from
                when the cursor left the bar. Already leaving: nothing to do. */
             LONG rest = cfgHideDelay - (LONG)(GetTickCount() - g_leaveAt);
@@ -2282,6 +1977,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l)
             g_frozen = 0;
             g_onBar = 0;
             DBG(("explhid takeover rest=%ld\r\n", rest));
+            InterlockedExchange(&g_holdPinned, 1);
+            tapPin(1);              /* Explorer leaves the bar alone from here on */
             if (rest <= 0) { g_mode = M_HIDDEN; g_explHid = 0; setDesired(D_HIDDEN); }
             else { g_mode = M_LEAVING; setDesired(D_HOLD); SetTimer(h, TIMER_HIDE, (UINT)rest, NULL); }
             return 0;
@@ -2625,7 +2322,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
 
     g_evt = CreateEventW(NULL, FALSE, FALSE, NULL);
     g_animThread = CreateThread(NULL, 64 * 1024, AnimThread, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    while (!a_snap) Sleep(1);
+    while (!a_cover) Sleep(1);
 
     engage();
     startGuard();
