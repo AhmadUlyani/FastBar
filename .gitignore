@@ -5,3 +5,6 @@ FastBar.ini
 tests/out/
 FastBarTap.dll
 FastBarTap.tmp
+build.log
+FastBarTap.release.dll
+FastBar-v*.zip
